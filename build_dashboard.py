@@ -1069,7 +1069,6 @@ def risk_section():
         f'<p class="agent-b">{T(p["body"])}'
         + (f' Detail in the docs: {ext(DOCS["governance"], "Governance and controls ↗")}.' if p.get("docs_link") else "")
         + "</p></div>" for p in RISK["permissions"])
-    rebalance_section = (f'<div class="sub-h">What the agent has done</div>{rebalance_card}' if rebalance_card else "")
     return f"""
 <section id="risk">
   <span class="label">How we manage risk</span>
@@ -1082,7 +1081,6 @@ def risk_section():
   <div class="stat-sub" style="margin-top:-6px">Agent settings as set on {esc(RISK['as_of'])}.</div>
   <div class="sub-h">How a signal is handled</div>
   {layers}
-  {rebalance_section}
   <div class="sub-h">The agents</div>
   <div class="grid g3">{agents}</div>
   <div class="sub-h">Onchain permissions</div>
@@ -1541,6 +1539,7 @@ page = f"""<!doctype html>
     </div>
   </div>
   <div class="stat-sub">{esc(position_age_note)} KPK curates both sides of the LsETH/USDC market, and holds the borrow rate competitive with comparable 86%-LLTV USDC markets such as wstETH/USDC and rETH/USDC. LsETH is marked at {money(lseth_price)} by the market's oracle; vault yields are net of the vaults' fees. Verify the collateral and borrow legs on {ext(debank_url, 'DeBank ↗')}, which shows both positions but not the underlying yield.</div>
+  {rebalance_card}
   {share_card}
   <div class="card">
     <div class="stat-label">Borrow rate and vault yields since the position opened</div>
