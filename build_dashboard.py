@@ -79,6 +79,7 @@ def build_chart(hist, start=None):
     # Second deploy vault; empty until its launch date, so every use below
     # guards on it and the chart degrades to the two-line version cleanly.
     rwap = since_open(hist.get("rwa_apy_pct") or [])
+    blendp = since_open(hist.get("blended_apy_pct") or [])
 
     # The axis starts at the opening itself; the first daily sample lands within a day of it.
     x0 = t_open if start else min(borrow[0]["t"], yieldp[0]["t"])
@@ -137,7 +138,7 @@ def build_chart(hist, start=None):
         # events exist on the vault. They are single-day jumps in a share-price-
         # derived APY, which a short lookback amplifies. State what is observed.
         label = (
-            f"Capped at {y_max:g}%: {clipped_days} one-day spikes "
+            f"Capped at {y_max:g}%: {clipped_days} days above it "
             f"({span_start} to {span_end}), peak {peak['y']:.0f}%"
         )
         annotation = (
@@ -234,6 +235,12 @@ def build_chart(hist, start=None):
     rwa_by_date = {}
     for p in rwap:
         rwa_by_date[utc(p["t"]).strftime("%Y-%m-%d")] = p["y"]
+    blend_by_date = {}
+    for p in blendp:
+        blend_by_date[utc(p["t"]).strftime("%Y-%m-%d")] = p["y"]
+
+    def cell(v, fmt="{:.2f}%"):
+        return fmt.format(v) if v is not None else "n/a"
 
     seen_dates = set()
     for p in sorted(borrow, key=lambda p: p["t"], reverse=True):
@@ -241,15 +248,12 @@ def build_chart(hist, start=None):
         if d in seen_dates:
             continue
         seen_dates.add(d)
-        yv = yield_by_date.get(d)
-        rv = rwa_by_date.get(d)
-        rcell = f"{rv:.2f}%" if rv is not None else "n/a"
-        delta_v = (yv - p["y"]) if yv is not None else None
+        bv = blend_by_date.get(d)
+        delta_v = (bv - p["y"]) if bv is not None else None
         table_rows.append(
             f'<tr><td class="nowrap">{d}</td><td class="num">{p["y"]:.2f}%</td>'
-            f'<td class="num">{yv:.2f}%</td><td class="num">{rcell}</td><td class="num">{delta_v:+.2f} pp</td></tr>'
-            if yv is not None else
-            f'<tr><td class="nowrap">{d}</td><td class="num">{p["y"]:.2f}%</td><td class="num">n/a</td><td class="num">{rcell}</td><td class="num">n/a</td></tr>'
+            f'<td class="num">{cell(yield_by_date.get(d))}</td><td class="num">{cell(rwa_by_date.get(d))}</td>'
+            f'<td class="num"><b>{cell(bv)}</b></td><td class="num">{cell(delta_v, "{:+.2f} pp")}</td></tr>'
         )
 
     # Left newest-first: the current rate is what a reader opening this table
@@ -258,6 +262,7 @@ def build_chart(hist, start=None):
     borrow_js = json.dumps([[p["t"], round(p["y"], 4)] for p in borrow])
     yield_js = json.dumps([[p["t"], round(p["y"], 4)] for p in yieldp])
     rwa_js = json.dumps([[p["t"], round(p["y"], 4)] for p in rwap])
+    blend_js = json.dumps([[p["t"], round(p["y"], 4)] for p in blendp])
 
     return {
         "svg": svg,
@@ -265,6 +270,7 @@ def build_chart(hist, start=None):
         "borrow_js": borrow_js,
         "yield_js": yield_js,
         "rwa_js": rwa_js,
+        "blend_js": blend_js,
         "scale": {"x0": x0, "x1": x1, "y_min": y_min, "y_max": y_max,
                   "pad_l": pad_l, "plot_w": plot_w, "pad_t": pad_t, "plot_h": plot_h},
     }
@@ -1255,17 +1261,18 @@ page = f"""<!doctype html>
         <div class="row"><span class="key" style="background:var(--c-yield)"></span>Yield<span class="val" id="ttYield"></span></div>
         <div class="row"><span class="key" style="background:var(--c-rwa)"></span>Yield RWA<span class="val" id="ttRwa"></span></div>
         <div class="row"><span class="key" style="background:var(--c-borrow)"></span>Borrow<span class="val" id="ttBorrow"></span></div>
+        <div class="row"><span style="width:10px"></span>Blended<span class="val" id="ttBlend"></span></div>
         <div class="row"><span style="width:10px"></span>Spread<span class="val" id="ttDelta"></span></div>
       </div>
     </div>
-    <div class="stat-sub">Daily borrow rate on the LsETH/USDC market against the net lend rate of both KPK USDC vaults; the fund has lent into KPK USDC Yield RWA since 27 Aug. The dashed line is KPK USDC Yield's 30-day trend.</div>
+    <div class="stat-sub">Daily borrow rate on the LsETH/USDC market against what both KPK USDC vaults paid: their realized rate as a 7-day average, net of fees and including Merkl rewards. The table's blended rate weights the two vaults by the fund's balance in each (KPK USDC Yield RWA since 27 Aug). The dashed line is KPK USDC Yield's 30-day trend.</div>
   </div>
   <div class="card">
     <details class="fold">
       <summary>Daily data table</summary>
       <div class="table-scroll">
         <table class="data">
-          <thead><tr><th>Date</th><th class="num">Borrow APY</th><th class="num">Yield APY</th><th class="num">RWA APY</th><th class="num">Spread (Yield - Borrow)</th></tr></thead>
+          <thead><tr><th>Date</th><th class="num">Borrow APY</th><th class="num">Yield APY</th><th class="num">RWA APY</th><th class="num">Blended APY</th><th class="num">Spread (Blended - Borrow)</th></tr></thead>
           <tbody>
           {chart['table_rows']}
           </tbody>
@@ -1345,6 +1352,7 @@ page = f"""<!doctype html>
   var borrow = {chart['borrow_js']};
   var yieldp = {chart['yield_js']};
   var rwap = {chart['rwa_js']};
+  var blendp = {chart['blend_js']};
   var scale = {{ x0: {chart['scale']['x0']}, x1: {chart['scale']['x1']}, padL: {chart['scale']['pad_l']}, plotW: {chart['scale']['plot_w']} }};
   var svg = document.getElementById('rateChart');
   var rect = document.getElementById('hoverRect');
@@ -1354,6 +1362,7 @@ page = f"""<!doctype html>
   var elYield = document.getElementById('ttYield');
   var elRwa = document.getElementById('ttRwa');
   var elBorrow = document.getElementById('ttBorrow');
+  var elBlend = document.getElementById('ttBlend');
   var elDelta = document.getElementById('ttDelta');
 
   function nearest(series, t) {{
@@ -1392,7 +1401,10 @@ page = f"""<!doctype html>
     }}
     elRwa.textContent = rshow;
     elBorrow.textContent = b[1].toFixed(2) + '%';
-    var d = y[1] - b[1];
+    var bl = blendp.length ? nearest(blendp, t) : null;
+    var blend = (bl && Math.abs(bl[0] - t) < 129600) ? bl[1] : y[1];
+    elBlend.textContent = blend.toFixed(2) + '%';
+    var d = blend - b[1];
     elDelta.textContent = (d >= 0 ? '+' : '') + d.toFixed(2) + ' pp';
 
     // Keep the tooltip inside the chart box at both ends.
