@@ -361,6 +361,97 @@ PEER_MARKETS = {
 }
 
 
+# --- Share-price reading (public RPC, no key) ----------------------------------------------------
+
+# Public Ethereum RPCs, tried in order. Keyless on purpose: the page builds in CI with no secrets.
+PUBLIC_RPCS = [
+    "https://ethereum-rpc.publicnode.com",
+    "https://rpc.mevblocker.io",
+    "https://eth.drpc.org",
+]
+LSETH = "0x8c1BEd5b9a0928467c9B1341Da1D7BD5e10b6549"  # Liquid Collective LsETH
+MORPHO_BLUE = "0xBBBBBbbBBb9cC5e90e3b3Af64bdAF62C37EEFFCb"
+# Function selectors, hashed once: getAccountNav(address,address), balanceOf(address),
+# getSharePrice(), totalSupply(), position(bytes32,address).
+SEL_NAV, SEL_BAL, SEL_SHARE_PRICE, SEL_SUPPLY, SEL_POSITION = (
+    "0xc3a28a14", "0x70a08231", "0x5b1dac60", "0x18160ddd", "0x93c52062")
+
+
+def _rpc_batch(calls: list) -> list:
+    """Send one JSON-RPC batch to the first public RPC that answers; results in call order."""
+    body = json.dumps([{"jsonrpc": "2.0", "id": i, **c} for i, c in enumerate(calls)]).encode()
+    last = None
+    for url in PUBLIC_RPCS:
+        try:
+            req = urllib.request.Request(
+                url, data=body, headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                out = json.loads(resp.read().decode())
+            by_id = {r["id"]: r for r in out}
+            if all("result" in by_id.get(i, {}) for i in range(len(calls))):
+                return [by_id[i]["result"] for i in range(len(calls))]
+            last = RuntimeError(f"{url}: incomplete batch")
+        except Exception as e:  # network or malformed reply: try the next RPC
+            last = e
+    raise RuntimeError(f"no public RPC answered: {last}")
+
+
+def _words(hexstr: str) -> list:
+    h = hexstr[2:]
+    return [int(h[i:i + 64], 16) for i in range(0, len(h), 64)]
+
+
+def fetch_share_price_reading(vault: str, shares: str, nav_calc: str,
+                              subaccount: str = DEFAULT_WALLET) -> dict | None:
+    """One reading of both share prices at the head block, from a public RPC.
+
+    c = the share price implied by KPK's NAV Calculator: (getAccountNav(subaccount, LsETH)
+        + the vault's own idle LsETH) / share supply.
+    r = the share price the vault has recorded (getSharePrice), which moves only at each NAV update.
+    s = share supply. t, b = block timestamp and number.
+
+    None for an empty vault or a bad read. getAccountNav very occasionally returns dust
+    instead of the real NAV (once printed a share price of 2.8e-10). Equity cannot be below
+    ~14% of collateral while the position is solvent at the market's 86% LLTV, so a reading
+    under 10% of collateral is impossible and is dropped, never plotted.
+    """
+    def pad(a: str) -> str:
+        return a[2:].lower().rjust(64, "0")
+
+    block = _rpc_batch([{"method": "eth_blockNumber", "params": []}])[0]
+
+    def at(to: str, data: str) -> dict:
+        return {"method": "eth_call", "params": [{"to": to, "data": data}, block]}
+
+    nav, idle, rec, sup, pos, blk = _rpc_batch([
+        at(nav_calc, SEL_NAV + pad(subaccount) + pad(LSETH)),
+        at(LSETH, SEL_BAL + pad(vault)),
+        at(vault, SEL_SHARE_PRICE),
+        at(shares, SEL_SUPPLY),
+        at(MORPHO_BLUE, SEL_POSITION + LSETH_USDC_MARKET_ID[2:] + pad(subaccount)),
+        {"method": "eth_getBlockByNumber", "params": [block, False]},
+    ])
+    supply = _words(sup)[0]
+    if supply == 0:
+        return None
+    nav_w = _words(nav)
+    nav_v = nav_w[1] if len(nav_w) > 1 else 0
+    if nav_v >= 2**255:  # int256
+        nav_v -= 2**256
+    idle_v = _words(idle)[0]
+    pos_w = _words(pos)  # supplyShares, borrowShares, collateral
+    collateral = pos_w[2] if len(pos_w) > 2 else 0
+    if collateral > 0 and (nav_v + idle_v) < collateral // 10:
+        return None
+    return {
+        "t": int(blk["timestamp"], 16),
+        "b": int(block, 16),
+        "c": (nav_v + idle_v) / supply,
+        "r": _words(rec)[0] / 1e18,
+        "s": supply / 1e18,
+    }
+
+
 def fetch_peer_borrow_rates() -> dict:
     """Live borrow APY on comparable 86%-LLTV USDC markets.
 

@@ -1,19 +1,26 @@
 #!/usr/bin/env python3
-"""Regenerates dashboard.html from live Morpho data. Run in place:
-    python3 build_dashboard.py
+"""Regenerates the LsETH Carry Fund page from live Morpho data. Run in place:
+    python3 build_dashboard.py [outfile]
+
+Layout and design system follow KPK's BTC Carry Fund board (assets/kpk-*.css).
+Editable copy and the agent settings the page states live in config.json.
 """
 import base64
+import html
 import json
+import math
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-FONT_DIR = HERE / "assets/fonts"
+ASSETS = HERE / "assets"
 # Overridable so CI can write index.html directly (GitHub Pages serves that name)
 # without a copy step. Defaults to dashboard.html for local runs.
 OUT = Path(sys.argv[1]) if len(sys.argv) > 1 else HERE / "dashboard.html"
-LOGO_SVG = HERE / "assets/logo/KPKDark.svg"
+CONFIG = json.loads((HERE / "config.json").read_text())
+ETHERSCAN = "https://etherscan.io"
 
 sys.path.insert(0, str(HERE))
 import position_tracker as pt  # noqa: E402
@@ -22,6 +29,28 @@ data = pt.fetch_position()
 hist = pt.fetch_apy_history()
 start = pt.fetch_strategy_start()
 lseth_apy = pt.fetch_lseth_staking_apy()
+
+
+def esc(x):
+    return html.escape(str(x), quote=True)
+
+
+def utc(ts):
+    return datetime.fromtimestamp(ts, tz=timezone.utc)
+
+
+def utc_ts(text):
+    """Epoch seconds for a 'YYYY-MM-DD HH:MM' UTC string."""
+    return int(datetime.strptime(text, "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc).timestamp())
+
+
+def sgn(x, dp=2):
+    """Signed number with an ASCII minus, never U+2212."""
+    return f"{x:+.{dp}f}"
+
+
+def money(x):
+    return ("-$" if x < 0 else "$") + f"{abs(x):,.0f}"
 
 
 def nice_step(raw_max):
@@ -38,13 +67,22 @@ def percentile(values, pct):
 
 
 def build_chart(hist, start=None):
-    borrow = hist["borrow_apy_pct"]
-    yieldp = hist["yield_apy_pct"]
+    # The chart starts when the position opened, not at the market launch: the
+    # earlier market and vault history is not the fund's track record.
+    t_open = start["timestamp"] if start else 0
+
+    def since_open(series):
+        return [p for p in series if p["t"] >= t_open]
+
+    borrow = since_open(hist["borrow_apy_pct"])
+    yieldp = since_open(hist["yield_apy_pct"])
     # Second deploy vault; empty until its launch date, so every use below
     # guards on it and the chart degrades to the two-line version cleanly.
-    rwap = hist.get("rwa_apy_pct") or []
+    rwap = since_open(hist.get("rwa_apy_pct") or [])
 
-    x0, x1 = min(borrow[0]["t"], yieldp[0]["t"]), max(borrow[-1]["t"], yieldp[-1]["t"])
+    # The axis starts at the opening itself; the first daily sample lands within a day of it.
+    x0 = t_open if start else min(borrow[0]["t"], yieldp[0]["t"])
+    x1 = max(borrow[-1]["t"], yieldp[-1]["t"])
 
     # The vault's net APY was volatile (6-25%) for roughly its first two
     # weeks on thin TVL before settling near 6-7.5% -- scaling the axis to
@@ -58,7 +96,7 @@ def build_chart(hist, start=None):
     y_max = step * (int(y_max_core * 1.15 / step) + 1)
     y_min = 0
 
-    pad_l, pad_r, pad_t, pad_b = 44, 10, 16, 30
+    pad_l, pad_r, pad_t, pad_b = 44, 56, 28, 30
     W, H = 840, 300
     plot_w, plot_h = W - pad_l - pad_r, H - pad_t - pad_b
 
@@ -83,51 +121,31 @@ def build_chart(hist, start=None):
     x_ticks = []
     for i in range(5):
         t = x0 + (x1 - x0) * i / 4
-        x_ticks.append((sx(t), datetime.fromtimestamp(t, tz=timezone.utc).strftime("%b %-d")))
+        x_ticks.append((sx(t), utc(t).strftime("%-d %b")))
 
     clipped = [p for p in yieldp + rwap if p["y"] > y_max]
     annotation = ""
     if clipped:
         peak = max(clipped, key=lambda p: p["y"])
         ax, ay = sx(peak["t"]), pad_t
-        span_start = datetime.fromtimestamp(min(p["t"] for p in clipped), tz=timezone.utc).strftime("%b %-d")
-        span_end = datetime.fromtimestamp(max(p["t"] for p in clipped), tz=timezone.utc).strftime("%b %-d")
+        span_start = utc(min(p["t"] for p in clipped)).strftime("%-d %b")
+        span_end = utc(max(p["t"] for p in clipped)).strftime("%-d %b")
+        clipped_days = len({utc(p["t"]).strftime("%Y-%m-%d") for p in clipped})
         # Don't assert a cause here. These spikes were checked against vault TVL
         # and allocation history: the vault was ~6 months old and held $3M+ on the
         # first one, so they are NOT a seeding artefact, and no forceDeallocate
         # events exist on the vault. They are single-day jumps in a share-price-
         # derived APY, which a short lookback amplifies. State what is observed.
         label = (
-            f"{len(clipped)} day(s) above {y_max:g}% ({span_start}–{span_end}), "
-            f"peak {peak['y']:.0f}% — single-day spikes in vault APY series; "
-            f"capped for readability"
+            f"Capped at {y_max:g}%: {clipped_days} one-day spikes "
+            f"({span_start} to {span_end}), peak {peak['y']:.0f}%"
         )
         annotation = (
             f'<g class="chart-annot">'
-            f'<line x1="{ax:.1f}" y1="{ay:.1f}" x2="{ax:.1f}" y2="{ay + 10:.1f}" stroke="var(--ink-soft)" stroke-width="1"/>'
-            f'<text x="{max(ax, pad_l + 4):.1f}" y="{ay - 4:.1f}" text-anchor="start">{label}</text>'
-            f"</g>"
-        )
-
-    # Marker for when the carry position actually opened. Everything left of it
-    # is market/vault history that predates us being in the trade at all -- worth
-    # shading, because otherwise the early seed-funding APY noise reads as if it
-    # were our performance. Clamped into the plot in case the entry precedes the
-    # chart window (it can't today, but a re-pointed market could).
-    entry_svg = ""
-    if start:
-        ex = min(max(sx(start["timestamp"]), pad_l), W - pad_r)
-        entry_label = datetime.fromtimestamp(start["timestamp"], tz=timezone.utc).strftime("%b %-d")
-        # Label sits left of the rule when it would otherwise overflow the right edge.
-        flip = ex > W - pad_r - 150
-        entry_svg = (
-            f'<g class="chart-entry">'
-            f'<rect x="{pad_l}" y="{pad_t}" width="{max(0, ex - pad_l):.1f}" height="{plot_h}" '
-            f'class="chart-preentry"/>'
-            f'<line x1="{ex:.1f}" y1="{pad_t}" x2="{ex:.1f}" y2="{pad_t + plot_h}" class="chart-entryline"/>'
-            f'<text x="{ex + (-6 if flip else 6):.1f}" y="{pad_t + plot_h - 8:.1f}" '
-            f'text-anchor="{"end" if flip else "start"}" class="chart-entrylabel">'
-            f'◀ before position · position opened {entry_label}</text>'
+            f'<line x1="{ax:.1f}" y1="{ay:.1f}" x2="{ax:.1f}" y2="{ay + 10:.1f}" stroke="var(--kpk-ink-muted)" stroke-width="1"/>'
+            # The label is wider than half the plot, so it sits right-aligned above the
+            # plot wherever the peak falls; the short tick marks the peak itself.
+            f'<text x="{W - pad_r:.1f}" y="{ay - 10:.1f}" text-anchor="end">{label}</text>'
             f"</g>"
         )
 
@@ -136,16 +154,16 @@ def build_chart(hist, start=None):
     # smoothing it away would hide the thing this chart exists to show. The trend
     # just gives the eye a stable reference through the noise. Dashed and thinner
     # so it reads as derived rather than as a second measurement.
-    # Only the yield leg gets a trend. The borrow rate is near-flat over this
-    # window (3.8-4.1%), so a trend line there is redundant; and Morpho returns
-    # nulls for `monthlyBorrowApy` until the market itself is 30 days old, so it
-    # would start a month late regardless. The vault's trend is derived from
-    # share price here, which is why it can cover the full window.
+    # Only the yield leg gets a trend. The borrow rate is near-flat, so a trend
+    # line there is redundant; and Morpho returns nulls for `monthlyBorrowApy`
+    # until the market itself is 30 days old, so it would start a month late
+    # regardless. The vault's trend is derived from share price here, which is
+    # why it can cover the full window.
     trend_paths = ""
-    yield_trend = hist.get("yield_apy_30d_pct")
+    yield_trend = since_open(hist.get("yield_apy_30d_pct") or [])
     if yield_trend and len(yield_trend) > 1:
         trend_paths = (
-            f'<path d="{path_for(yield_trend)}" fill="none" stroke="var(--chart-yield)" '
+            f'<path d="{path_for(yield_trend)}" fill="none" stroke="var(--c-yield)" '
             f'stroke-width="1.25" stroke-dasharray="5 4" opacity="0.85" '
             f'stroke-linejoin="round" stroke-linecap="round"/>'
         )
@@ -153,26 +171,26 @@ def build_chart(hist, start=None):
     borrow_end = borrow[-1]
     yield_end = yieldp[-1]
     rwa_end = rwap[-1] if rwap else None
-    # Spread the end labels at least 16px apart, preserving their value order,
-    # so two or three near-equal rates never overprint each other.
+    # End labels sit in the right margin, beside their dots, spread at least 15px
+    # apart in value order so near-equal rates never overprint each other.
     ends = {"b": sy(borrow_end["y"]), "y": sy(yield_end["y"])}
     if rwa_end:
         ends["r"] = sy(rwa_end["y"])
     order = sorted(ends, key=lambda k: ends[k])
     for i in range(1, len(order)):
-        if ends[order[i]] - ends[order[i - 1]] < 16:
-            ends[order[i]] = ends[order[i - 1]] + 16
+        if ends[order[i]] - ends[order[i - 1]] < 15:
+            ends[order[i]] = ends[order[i - 1]] + 15
     ey_b, ey_y = ends["b"], ends["y"]
     ey_r = ends.get("r")
 
     rwa_svg = ""
     if rwa_end:
         rwa_svg = (
-            f'<path d="{path_for(rwap)}" fill="none" stroke="var(--chart-rwa)" '
+            f'<path d="{path_for(rwap)}" fill="none" stroke="var(--c-rwa)" '
             f'stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>'
-            f'<circle cx="{sx(rwa_end["t"]):.1f}" cy="{ey_r:.1f}" r="4" fill="var(--chart-rwa)" stroke="var(--surface)" stroke-width="2"/>'
-            f'<text x="{sx(rwa_end["t"]) - 8:.1f}" y="{ey_r:.1f}" text-anchor="end" dominant-baseline="middle" '
-            f'class="chart-endlabel" fill="var(--chart-rwa)">{rwa_end["y"]:.2f}%</text>'
+            f'<circle cx="{sx(rwa_end["t"]):.1f}" cy="{ey_r:.1f}" r="4" fill="var(--c-rwa)" stroke="var(--kpk-surface-card)" stroke-width="2"/>'
+            f'<text x="{sx(rwa_end["t"]) + 9:.1f}" y="{ey_r:.1f}" text-anchor="start" dominant-baseline="middle" '
+            f'class="chart-endlabel" fill="var(--c-rwa)">{rwa_end["y"]:.2f}%</text>'
         )
 
     grid_svg = "\n".join(
@@ -186,19 +204,18 @@ def build_chart(hist, start=None):
     )
 
     svg = f"""
-    <svg viewBox="0 0 {W} {H}" class="chart-svg" role="img" aria-label="Borrow APY and deploy-vault yield APYs, daily, since market inception">
+    <svg viewBox="0 0 {W} {H}" id="rateChart" class="chart-svg" role="img" aria-label="Borrow APY and KPK USDC vault yield APYs, daily, since the position opened">
       <g>{grid_svg}</g>
       <g>{xtick_svg}</g>
-      {entry_svg}
       {annotation}
-      <path d="{path_for(borrow)}" fill="none" stroke="var(--chart-borrow)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
-      <path d="{path_for(yieldp)}" fill="none" stroke="var(--chart-yield)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+      <path d="{path_for(borrow)}" fill="none" stroke="var(--c-borrow)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+      <path d="{path_for(yieldp)}" fill="none" stroke="var(--c-yield)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
       {rwa_svg}
       {trend_paths}
-      <circle cx="{sx(borrow_end['t']):.1f}" cy="{ey_b:.1f}" r="4" fill="var(--chart-borrow)" stroke="var(--surface)" stroke-width="2"/>
-      <circle cx="{sx(yield_end['t']):.1f}" cy="{ey_y:.1f}" r="4" fill="var(--chart-yield)" stroke="var(--surface)" stroke-width="2"/>
-      <text x="{sx(borrow_end['t']) - 8:.1f}" y="{ey_b:.1f}" text-anchor="end" dominant-baseline="middle" class="chart-endlabel" fill="var(--chart-borrow)">{borrow_end['y']:.2f}%</text>
-      <text x="{sx(yield_end['t']) - 8:.1f}" y="{ey_y:.1f}" text-anchor="end" dominant-baseline="middle" class="chart-endlabel" fill="var(--chart-yield)">{yield_end['y']:.2f}%</text>
+      <circle cx="{sx(borrow_end['t']):.1f}" cy="{ey_b:.1f}" r="4" fill="var(--c-borrow)" stroke="var(--kpk-surface-card)" stroke-width="2"/>
+      <circle cx="{sx(yield_end['t']):.1f}" cy="{ey_y:.1f}" r="4" fill="var(--c-yield)" stroke="var(--kpk-surface-card)" stroke-width="2"/>
+      <text x="{sx(borrow_end['t']) + 9:.1f}" y="{ey_b:.1f}" text-anchor="start" dominant-baseline="middle" class="chart-endlabel" fill="var(--c-borrow)">{borrow_end['y']:.2f}%</text>
+      <text x="{sx(yield_end['t']) + 9:.1f}" y="{ey_y:.1f}" text-anchor="start" dominant-baseline="middle" class="chart-endlabel" fill="var(--c-yield)">{yield_end['y']:.2f}%</text>
       <rect id="hoverRect" x="{pad_l}" y="{pad_t}" width="{plot_w}" height="{plot_h}" fill="transparent"/>
       <line id="crosshair" x1="0" y1="{pad_t}" x2="0" y2="{pad_t + plot_h}" class="chart-crosshair" visibility="hidden"/>
     </svg>
@@ -208,31 +225,31 @@ def build_chart(hist, start=None):
     # Key on the UTC date, not the raw timestamp: the market's series ends with
     # a partial-day sample stamped at the current wall-clock second, which
     # never equals the vault's midnight-aligned stamp. Matching on timestamp
-    # emitted a duplicate row for today with an em-dash yield; matching on date
+    # emitted a duplicate row for today with no yield; matching on date
     # pairs them, and keeping the newest sample per date lets the live partial
     # point supersede that date's earlier midnight one.
     yield_by_date = {}
     for p in yieldp:
-        yield_by_date[datetime.fromtimestamp(p["t"], tz=timezone.utc).strftime("%Y-%m-%d")] = p["y"]
+        yield_by_date[utc(p["t"]).strftime("%Y-%m-%d")] = p["y"]
     rwa_by_date = {}
     for p in rwap:
-        rwa_by_date[datetime.fromtimestamp(p["t"], tz=timezone.utc).strftime("%Y-%m-%d")] = p["y"]
+        rwa_by_date[utc(p["t"]).strftime("%Y-%m-%d")] = p["y"]
 
     seen_dates = set()
     for p in sorted(borrow, key=lambda p: p["t"], reverse=True):
-        d = datetime.fromtimestamp(p["t"], tz=timezone.utc).strftime("%Y-%m-%d")
+        d = utc(p["t"]).strftime("%Y-%m-%d")
         if d in seen_dates:
             continue
         seen_dates.add(d)
         yv = yield_by_date.get(d)
         rv = rwa_by_date.get(d)
-        rcell = f"{rv:.2f}%" if rv is not None else "—"
+        rcell = f"{rv:.2f}%" if rv is not None else "n/a"
         delta_v = (yv - p["y"]) if yv is not None else None
         table_rows.append(
-            f"<tr><td>{d}</td><td>{p['y']:.2f}%</td>"
-            f"<td>{yv:.2f}%</td><td>{rcell}</td><td>{delta_v:+.2f} pp</td></tr>"
+            f'<tr><td class="nowrap">{d}</td><td class="num">{p["y"]:.2f}%</td>'
+            f'<td class="num">{yv:.2f}%</td><td class="num">{rcell}</td><td class="num">{delta_v:+.2f} pp</td></tr>'
             if yv is not None else
-            f"<tr><td>{d}</td><td>{p['y']:.2f}%</td><td>—</td><td>{rcell}</td><td>—</td></tr>"
+            f'<tr><td class="nowrap">{d}</td><td class="num">{p["y"]:.2f}%</td><td class="num">n/a</td><td class="num">{rcell}</td><td class="num">n/a</td></tr>'
         )
 
     # Left newest-first: the current rate is what a reader opening this table
@@ -254,165 +271,375 @@ def build_chart(hist, start=None):
 
 
 chart = build_chart(hist, start)
-since_date = datetime.fromtimestamp(hist["since"], tz=timezone.utc).strftime("%b %-d, %Y")
 
 
-def b64_font(name):
-    return base64.b64encode((FONT_DIR / name).read_bytes()).decode()
+# --- Share price in LsETH ------------------------------------------------------------------------
+#
+# share_price.jsonl holds one reading per line: t (UTC epoch), b (block), c (share price implied by
+# KPK's NAV Calculator), r (share price the vault has recorded), s (share supply). It was backfilled
+# once from the hourly NAV samples in karpatkey/curation-dune (scripts/upshift_lseth_nav_samples.json,
+# read by archive RPC there). Each build appends one more reading from a public RPC, so CI needs
+# no key; the workflow commits the file.
+SHARES_PATH = HERE / "share_price.jsonl"
+SHARE_CFG = CONFIG["share_chart"]
+HALF_HOUR = 1800
 
 
-fonts = {
-    "regular": b64_font("Lexend-Regular.ttf"),
-    "medium": b64_font("Lexend-Medium.ttf"),
-    "semibold": b64_font("Lexend-SemiBold.ttf"),
-    "bold": b64_font("Lexend-Bold.ttf"),
-}
+def load_share_rows():
+    """The committed readings, oldest first. A bad line is skipped, never fatal."""
+    rows = []
+    if SHARES_PATH.exists():
+        for line in SHARES_PATH.read_text().splitlines():
+            try:
+                rows.append(json.loads(line))
+            except ValueError:
+                continue
+    return sorted(rows, key=lambda r: r["t"])
 
-logo_svg = LOGO_SVG.read_text().replace('fill="#1C1C1C"', 'fill="currentColor"')
-# strip the xml viewbox wrapper's fixed width/height so CSS can size it
-logo_svg = logo_svg.replace('width="941" height="282" ', "")
+
+def append_share_reading(rows):
+    """Append one live reading to the file and to rows, unless it is stale, bad or unreachable."""
+    try:
+        reading = pt.fetch_share_price_reading(
+            CONFIG["contracts"]["vault"], CONFIG["contracts"]["shares"], CONFIG["contracts"]["nav_calculator"])
+    except Exception as e:  # a failed read must never fail the build
+        print(f"share price reading skipped: {e}", file=sys.stderr)
+        return
+    if not reading or (rows and (reading["b"] <= rows[-1]["b"] or reading["t"] - rows[-1]["t"] < HALF_HOUR)):
+        return
+    reading = {"t": reading["t"], "b": reading["b"], "c": round(reading["c"], 9),
+               "r": round(reading["r"], 9), "s": round(reading["s"], 6)}
+    with SHARES_PATH.open("a") as f:
+        f.write(json.dumps(reading, separators=(",", ":")) + "\n")
+    rows.append(reading)
+
+
+def build_share_chart(rows, start):
+    """Share price in LsETH since the position opened: the vault's recorded price (a step at each
+    NAV update) against the price implied by KPK's NAV Calculator (continuous)."""
+    t_open = start["timestamp"] if start else 0
+    rows = [r for r in rows if r["t"] >= t_open]
+    if len(rows) < 2:
+        return None
+
+    x0, x1 = rows[0]["t"], rows[-1]["t"]
+    lo = min(min(r["c"], r["r"]) for r in rows)
+    hi = max(max(r["c"], r["r"]) for r in rows)
+    room = max(hi - lo, 1e-5) * 0.12
+    y_lo, y_hi = lo - room, hi + room
+    raw = (y_hi - y_lo) / 5
+    mag = 10 ** math.floor(math.log10(raw))
+    step = next(m * mag for m in (1, 2, 5, 10) if m * mag >= raw)
+    decimals = max(3, math.ceil(-math.log10(step)))
+    tick_vals = [k * step for k in range(math.ceil(y_lo / step), math.floor(y_hi / step) + 1)]
+
+    pad_l, pad_r, pad_t, pad_b = 60, 64, 16, 30
+    W, H = 840, 300
+    plot_w, plot_h = W - pad_l - pad_r, H - pad_t - pad_b
+
+    def sx(t):
+        return pad_l + (t - x0) / (x1 - x0) * plot_w
+
+    def sy(v):
+        return pad_t + (1 - (v - y_lo) / (y_hi - y_lo)) * plot_h
+
+    grid = "\n".join(
+        f'<line x1="{pad_l}" y1="{sy(v):.1f}" x2="{W - pad_r}" y2="{sy(v):.1f}" class="chart-grid"/>'
+        f'<text x="{pad_l - 8}" y="{sy(v):.1f}" class="chart-ytick" text-anchor="end" dominant-baseline="middle">{v:.{decimals}f}</text>'
+        for v in tick_vals)
+    xticks = "\n".join(
+        f'<text x="{sx(x0 + (x1 - x0) * i / 4):.1f}" y="{H - pad_b + 18:.1f}" class="chart-xtick" text-anchor="middle">'
+        f'{utc(x0 + (x1 - x0) * i / 4).strftime("%-d %b")}</text>' for i in range(5))
+
+    # The NAV Calculator line, one point per reading, thinned to one per 6 hours for the page.
+    calc, last_kept = [], None
+    for r in rows:
+        if last_kept is None or r["t"] - last_kept >= 6 * 3600:
+            calc.append([r["t"], r["c"]])
+            last_kept = r["t"]
+    if calc[-1][0] != rows[-1]["t"]:
+        calc.append([rows[-1]["t"], rows[-1]["c"]])
+
+    # The recorded price holds its value until the next NAV update: a staircase.
+    steps = [[rows[0]["t"], rows[0]["r"]]]
+    for r in rows[1:]:
+        if r["r"] != steps[-1][1]:
+            steps.append([r["t"], r["r"]])
+    d = [f"M{sx(steps[0][0]):.1f},{sy(steps[0][1]):.1f}"]
+    for (_, prev), (t, v) in zip(steps, steps[1:]):
+        d.append(f"L{sx(t):.1f},{sy(prev):.1f} L{sx(t):.1f},{sy(v):.1f}")
+    d.append(f"L{sx(x1):.1f},{sy(steps[-1][1]):.1f}")
+    rec_path = " ".join(d)
+    calc_path = " ".join(f"{'M' if i == 0 else 'L'}{sx(t):.1f},{sy(v):.1f}" for i, (t, v) in enumerate(calc))
+
+    # Marks: the dated events from config, plus any subscription or redemption that moved the supply.
+    marks = [(utc_ts(e["t"]), e["label"]) for e in SHARE_CFG["events"]]
+    min_flow = SHARE_CFG["min_flow_pct"] / 100
+    for prev, cur in zip(rows, rows[1:]):
+        if prev["s"] > 0 and abs(cur["s"] / prev["s"] - 1) >= min_flow:
+            amount = abs(cur["s"] - prev["s"]) * cur["c"]
+            marks.append((cur["t"], f"{amount:.0f} LsETH {'subscribed' if cur['s'] > prev['s'] else 'redeemed'}"))
+    mark_svg = ""
+    for t, label in sorted(marks):
+        if x0 <= t <= x1:
+            x = sx(t)
+            mark_svg += (
+                f'<line x1="{x:.1f}" y1="{pad_t}" x2="{x:.1f}" y2="{pad_t + plot_h}" class="chart-mark"/>'
+                f'<text class="chart-marklabel" transform="rotate(-90 {x - 5:.1f} {pad_t + 6})" '
+                f'x="{x - 5:.1f}" y="{pad_t + 6}" text-anchor="end">{esc(label)}</text>')
+
+    # End values: nearly equal, so spread the two labels apart in value order.
+    ends = {"c": sy(rows[-1]["c"]), "r": sy(rows[-1]["r"])}
+    upper, lower = sorted(ends, key=lambda k: ends[k])
+    if ends[lower] - ends[upper] < 15:
+        ends[lower] = ends[upper] + 15
+    end_svg = ""
+    for key, color in (("c", "var(--c-good)"), ("r", "var(--kpk-ink)")):
+        # Coloured by inline style, which beats the grey `.chart-svg text` rule; the two ends are
+        # a few pixels apart, so a dot each would overprint and the colour carries the match.
+        end_svg += (
+            f'<text x="{sx(x1) + 9:.1f}" y="{ends[key]:.1f}" text-anchor="start" dominant-baseline="middle" '
+            f'class="chart-endlabel" style="fill:{color};font-weight:600">{rows[-1][key]:.5f}</text>')
+
+    svg = f"""
+    <svg viewBox="0 0 {W} {H}" id="shareChart" class="chart-svg" role="img" aria-label="Share price in LsETH since the position opened: the vault's recorded price against the price from KPK's NAV Calculator">
+      <g>{grid}</g>
+      <g>{xticks}</g>
+      {mark_svg}
+      <path d="{calc_path}" fill="none" stroke="var(--c-good)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+      <path d="{rec_path}" fill="none" stroke="var(--kpk-ink)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+      {end_svg}
+      <rect id="shareHover" x="{pad_l}" y="{pad_t}" width="{plot_w}" height="{plot_h}" fill="transparent"/>
+      <line id="shareCrosshair" x1="0" y1="{pad_t}" x2="0" y2="{pad_t + plot_h}" class="chart-crosshair" visibility="hidden"/>
+    </svg>
+    """
+    return {"svg": svg, "calc_js": json.dumps([[t, round(v, 7)] for t, v in calc]),
+            "rec_js": json.dumps([[t, round(v, 7)] for t, v in steps]),
+            "scale": {"x0": x0, "x1": x1, "pad_l": pad_l, "plot_w": plot_w}}
+
+
+share_rows = load_share_rows()
+append_share_reading(share_rows)
+share_chart = build_share_chart(share_rows, start)
+
+# --- Design system: the BTC board's tokens, fonts, logo and protocol icons ---------------------
+
+tokens_css = re.sub(r"/\*[\s\S]*?\*/", "", (ASSETS / "kpk-tokens.css").read_text())
+fonts_css = re.sub(r"/\*[\s\S]*?\*/", "", (ASSETS / "kpk-fonts.css").read_text())
+dark_block = re.search(r':root\[data-theme="dark"\],\s*\.dark\s*\{([\s\S]*?)\}', tokens_css).group(1)
+logo_svg = (ASSETS / "kpk-logo.svg").read_text()
+LOGOS = {p.stem: "data:image/webp;base64," + base64.b64encode(p.read_bytes()).decode()
+         for p in sorted((ASSETS / "logos").glob("*.webp"))}
+# Upshift's mark is a rounded square; cropping it to a circle would cut it.
+SQUARE_LOGOS = {"upshift"}
+
+
+def icon(name, size=22):
+    src = LOGOS.get(name)
+    if not src:
+        return ""
+    cls = "logo-icon sq" if name in SQUARE_LOGOS else "logo-icon"
+    return f'<img class="{cls}" src="{src}" width="{size}" height="{size}" alt="">'
+
+
+# --- Data ---------------------------------------------------------------------------------------
 
 wallet = data["wallet"]
 coll = data["collateral"]
 borrow = data["borrow"]
 dep = data["deposit"]
 ltv = data["ltv_pct"]
-delta = data["delta_apy_pp"]
-net_lseth = data["net_apy_lseth_terms_pct"]
 lltv = data["lltv_pct"]
 lseth_price = coll["price_usd"]
 spreads = data["spreads_pp"]
+legs_by_horizon = data["legs_by_horizon"]
+# Health factor on Morpho is LLTV / LTV; liquidation when the collateral price
+# falls by that same ratio.
+hf_now = lltv / ltv if ltv > 0 else None
+liq_px = lseth_price * ltv / lltv if ltv > 0 else None
 per_unit_borrow = lseth_price * ltv / 100
-
-# Gradient stops for the LTV track, as a fraction of the 0..LLTV span.
-#
-# Four bands, so "above target" and "near liquidation" are visually distinct
-# rather than both red: green to 70, olive 71-75 (through the operating target),
-# orange 76-80, red above. 75% is the intended target so it must not look like a
-# warning, but the ramp has to bite soon after -- at 86% LLTV there is very little
-# buffer left by 81%.
-grad_safe_pct = 70.0 / lltv * 100     # green ends
-grad_mid_pct = 75.0 / lltv * 100      # olive, through the target
-grad_warn_pct = 80.0 / lltv * 100     # orange ends, red beyond
 
 # 10% performance fee on the carry, matching the Phase 1 backtest's `x 0.9`
 # (Notion: "lsETH Phase 1 carry -- backtest methodology & results"). Stated
 # explicitly on the page because a reader who recomputes spread x LTV without it
 # gets a higher number and assumes an error.
-# Live first and default. KPK is the sole supplier and sole borrower in this
+PERF_FEE = float(CONFIG["performance_fee"])
+net_fee_multiplier = 1 - PERF_FEE
+
+# Live first in the picker. KPK is the sole supplier and sole borrower in this
 # market, so the live borrow rate is the one its own automations govern -- that
-# makes it the forward-looking basis here, not a mere snapshot. The trailing
-# averages are the reality check on it.
+# makes it the forward-looking basis, not a mere snapshot. The trailing averages
+# are the reality check on it.
 _SPREAD_LABELS = [
     ("spot", "Live"),
     ("7d", "7d avg"),
     ("30d", "30d avg"),
 ]
-_available_spreads = [(k, lbl) for k, lbl in _SPREAD_LABELS if spreads.get(k) is not None]
+# Trailing spreads, kept only where the API returned a value (a young vault has
+# no 30d realized APY yet, so these can legitimately be None).
+bases = {
+    k: {"label": lbl, "spread": spreads[k],
+        "yield": legs_by_horizon[k]["yield_pct"], "borrow": legs_by_horizon[k]["borrow_pct"]}
+    for k, lbl in _SPREAD_LABELS
+    if spreads.get(k) is not None and legs_by_horizon.get(k)
+}
 # Default to a trailing basis for the headline: the instantaneous vault rate can
 # swing close to a point within an hour (observed 6.41% -> 5.55% in 8 minutes on
 # 2026-08-10), which makes the live print a poor first impression for an external
 # reader. 7d over 30d (Giel's call, 2026-08-10): the position is days old and its
 # market is weeks old, so a 30d window leans on rates from before the position
 # existed. Live stays one click away and is still the operationally-governed rate.
-_default_basis = "7d" if spreads.get("7d") is not None else "spot"
-legs_by_horizon = data["legs_by_horizon"]
-utilization_pct = data.get("utilization_pct") or 0.0
+_default_basis = "7d" if "7d" in bases else "spot"
+B0 = bases[_default_basis]
+carry_head = B0["spread"] * ltv / 100 * net_fee_multiplier
 
-PERF_FEE = 0.10
-net_fee_multiplier = 1 - PERF_FEE
 
-# Headline runs on the default (forward) basis so the page's first number and the
-# simulator agree on load. `delta`/`net_lseth` stay spot for the live-position
-# table, which reports what the position is actually earning right now.
-default_spread = spreads[_default_basis]
-default_legs = legs_by_horizon[_default_basis]
-net_lseth_after_fee = default_spread * ltv / 100 * net_fee_multiplier
+def basis_word(label):
+    return label.lower()
 
-# Total APY = lsETH's own staking yield + the carry. The staking leg comes from
-# DefiLlama (Morpho serves null for it); if that fetch failed, fall back to
-# showing LLTV rather than inventing a staking rate.
-if lseth_apy is not None:
-    total_apy_card = f"""<div class="mini-stat">
-        <span class="label">
-          Total APY on lsETH
-          <em class="sublabel">{lseth_apy:.2f}% staking + <span id="carryPart">{net_lseth_after_fee:.2f}</span>% carry</em>
-        </span>
-        <span class="value" style="color:var(--good)" id="totalApy">{lseth_apy + net_lseth_after_fee:.2f}%</span>
-      </div>"""
-else:
-    total_apy_card = f"""<div class="mini-stat">
-        <span class="label">Liquidation LTV (LLTV) on this market</span>
-        <span class="value">{lltv:.1f}%</span>
-      </div>"""
-
-lseth_apy_js = f"{lseth_apy:.6f}" if lseth_apy is not None else "null"
-
-# What the same structure yields at the 75% operating target, on the 30-day
-# spread rather than today's spot -- the pairing that matches the backtest's
-# basis. Falls back to the spot spread if the 30d average isn't available.
-TARGET_LTV = 75.0
-carry_at_target = default_spread * TARGET_LTV / 100 * net_fee_multiplier
-
-default_basis_label = dict(_SPREAD_LABELS)[_default_basis]
-default_basis_sub = (
-    "live spot rates" if _default_basis == "spot"
-    else f"{default_basis_label} (trailing)"
-)
-default_yield_sub = "Yield APY" if _default_basis == "spot" else f"Yield, {default_basis_label}"
-default_borrow_sub = "Borrow APY" if _default_basis == "spot" else f"Borrow, {default_basis_label}"
-
-# Trailing spreads, rendered only where the API returned a value (a young vault
-# has no 30d realized APY yet, so these can legitimately be None).
-spread_buttons = "\n".join(
-    f'<button type="button" class="spread-btn" data-spread="{spreads[key]:.6f}"'
-    f' data-yield="{legs_by_horizon[key]["yield_pct"]:.6f}"'
-    f' data-borrow="{legs_by_horizon[key]["borrow_pct"]:.6f}"'
-    f' aria-current="{"true" if key == _default_basis else "false"}">'
-    f'<i>{label}</i><b>{spreads[key]:+.2f} pp</b></button>'
-    for key, label in _available_spreads
-    if legs_by_horizon.get(key)
-)
-
-if start:
-    _age_days = max(0, (datetime.now(timezone.utc)
-                        - datetime.fromtimestamp(start["timestamp"], tz=timezone.utc)).days)
-    _opened = datetime.fromtimestamp(start["timestamp"], tz=timezone.utc).strftime("%b %-d, %Y at %H:%M UTC")
-    position_age_note = (
-        f"Position opened {_opened} "
-        f"({'today' if _age_days == 0 else f'{_age_days} day(s) ago'}), "
-        f"borrowing {start['borrowed_usdc']:,.0f} USDC."
-    )
-    entry_sentence = (
-        f"The position itself opened {_opened} — the market and vault history "
-        f"before that line is context, not our track record."
-    )
-else:
-    position_age_note = "No borrow found for this wallet on the lsETH/USDC market."
-    entry_sentence = ""
-
-market_url = "https://app.morpho.org/ethereum/market/0xfb7d54e0ce71efc8fffd3f4e1db0afa9265882da5cc76604b62adfac64501e80/lseth-usdc"
-vault_url = "https://app.morpho.org/ethereum/vault/0xD5cCe260E7a755DDf0Fb9cdF06443d593AaeaA13"
-rwa_url = "https://app.morpho.org/ethereum/vault/0x7a72bcD2c3F7F7e4D6679170a0625bAB15D7DDa1"
 
 # Deposit split across the two deploy vaults, from the tracker's per-vault detail.
 # Falls back to 100/0 if the position ever consolidates back to one vault.
-_pv = {v["vault"]: v for v in dep.get("vaults", [])}
-_yield_v = next((v for v in dep.get("vaults", []) if "RWA" not in v["vault"]), None)
-_rwa_v = next((v for v in dep.get("vaults", []) if "RWA" in v["vault"]), None)
+_vaults = dep.get("vaults", [])
+_yield_v = next((v for v in _vaults if "RWA" not in v["vault"]), None)
+_rwa_v = next((v for v in _vaults if "RWA" in v["vault"]), None)
 yield_w = (_yield_v["weight"] * 100) if _yield_v else 100.0
 rwa_w = (_rwa_v["weight"] * 100) if _rwa_v else 0.0
 
-# Per-vault rows for the live-position table.
-deposit_rows = "\n          ".join(
-    f"<tr><td>Deposit · {'KPK USDC Yield RWA' if 'RWA' in v['vault'] else 'KPK USDC Yield'}"
-    f"</td><td>{v['amount']:,.2f}</td><td>${v['usd']:,.0f}</td>"
-    f"<td>{v['apy_pct']:.2f}%</td></tr>"
-    for v in dep.get("vaults", [])
-)
+# --- Health factor manager settings (config.json), as LTV at the market's live LLTV ------------
+
+HFM = CONFIG["health_factor_manager"]
+
+
+def ltv_of(hf):
+    return lltv / hf
+
+
+BAND = {
+    "lo": ltv_of(HFM["borrow_above"]),     # above this health factor (below this LTV) it borrows
+    "borrow_to": ltv_of(HFM["borrow_to"]),
+    "repay_to": ltv_of(HFM["repay_to"]),
+    "hi": ltv_of(HFM["repay_below"]),      # below this health factor (above this LTV) it repays
+}
+TARGET_LTV = float(CONFIG["target_ltv"])
+
+V = {
+    "repay_below": f"{HFM['repay_below']:g}",
+    "repay_to": f"{HFM['repay_to']:g}",
+    "borrow_above": f"{HFM['borrow_above']:g}",
+    "borrow_to": f"{HFM['borrow_to']:g}",
+    "repay_below_ltv": f"{BAND['hi']:.1f}%",
+    "repay_to_ltv": f"{BAND['repay_to']:.1f}%",
+    "borrow_above_ltv": f"{BAND['lo']:.1f}%",
+    "borrow_to_ltv": f"{BAND['borrow_to']:.1f}%",
+    "min_change": f"{HFM['min_change_usdc']:,}",
+    "split_yield": f"{HFM['split']['yield']:g}",
+    "split_rwa": f"{HFM['split']['rwa']:g}",
+    "lltv": f"{lltv:.0f}%",
+    "target_ltv": f"{TARGET_LTV:g}%",
+    "live_yield": f"{yield_w:.0f}",
+    "live_rwa": f"{rwa_w:.0f}",
+}
+
+
+def T(s):
+    """Config copy with its {placeholders} filled, HTML-escaped."""
+    return esc(s.format(**V))
+
+
+# --- Position age ------------------------------------------------------------
+
+if start:
+    _age_days = max(0, (datetime.now(timezone.utc) - utc(start["timestamp"])).days)
+    _opened = utc(start["timestamp"]).strftime("%-d %b %Y at %H:%M UTC")
+    position_age_note = (
+        f"Position opened {_opened} "
+        f"({'today' if _age_days == 0 else f'{_age_days} days ago'}), "
+        f"borrowing {start['borrowed_usdc']:,.0f} USDC."
+    )
+else:
+    position_age_note = "No borrow found for this wallet on the LsETH/USDC market."
+
+DOCS = CONFIG["docs"]
+CONTRACTS = CONFIG["contracts"]
+MAIN_RISKS = CONFIG["main_risks"]
+risk_rows = "".join(
+    f'<div class="risk-row"><div class="risk-n">{esc(n)}</div><div class="risk-d">{T(d)}</div><div class="risk-h">{T(h)}</div></div>'
+    for n, d, h in MAIN_RISKS["rows"])
+
+share_card = ""
+if share_chart:
+    share_card = f'''<div class="card">
+    <div class="stat-label">Share price in LsETH since the position opened</div>
+    <div class="legend">
+      <span><i style="border-top-color:var(--kpk-ink)"></i>Upshift share price (recorded at each NAV update)</span>
+      <span><i style="border-top-color:var(--c-good)"></i>KPK NAV Calculator (live)</span>
+    </div>
+    <div class="chart">
+      {share_chart['svg']}
+      <div id="shareTooltip" class="chart-tooltip" role="status">
+        <div class="date" id="stDate"></div>
+        <div class="row"><span class="key" style="background:var(--c-good)"></span>NAV Calculator<span class="val" id="stCalc"></span></div>
+        <div class="row"><span class="key" style="background:var(--kpk-ink)"></span>Upshift recorded<span class="val" id="stRec"></span></div>
+      </div>
+    </div>
+    <div class="stat-sub">The vault records its share price at each NAV update, twice a week, so the Upshift line moves in steps. KPK's NAV can be read onchain at any block, which gives the continuous line.</div>
+  </div>'''
+
+share_js = ""
+if share_chart:
+    share_js = f'''<script>
+(function() {{
+  var calc = {share_chart['calc_js']};
+  var rec = {share_chart['rec_js']};
+  var scale = {{ x0: {share_chart['scale']['x0']}, x1: {share_chart['scale']['x1']}, padL: {share_chart['scale']['pad_l']}, plotW: {share_chart['scale']['plot_w']} }};
+  var svg = document.getElementById('shareChart');
+  var rect = document.getElementById('shareHover');
+  var crosshair = document.getElementById('shareCrosshair');
+  var tooltip = document.getElementById('shareTooltip');
+  if (!svg || !rect) return;
+
+  function nearest(series, t) {{
+    var best = series[0];
+    for (var i = 1; i < series.length; i++) {{
+      if (Math.abs(series[i][0] - t) < Math.abs(best[0] - t)) best = series[i];
+    }}
+    return best;
+  }}
+  function recordedAt(t) {{
+    var v = rec[0][1];
+    for (var i = 0; i < rec.length && rec[i][0] <= t; i++) v = rec[i][1];
+    return v;
+  }}
+  function show(e) {{
+    var box = svg.getBoundingClientRect();
+    var px = e.clientX - box.left;
+    var frac = Math.max(0, Math.min(1, (px * (840 / box.width) - scale.padL) / scale.plotW));
+    var p = nearest(calc, scale.x0 + frac * (scale.x1 - scale.x0));
+    var xv = (p[0] - scale.x0) / (scale.x1 - scale.x0) * scale.plotW + scale.padL;
+    crosshair.setAttribute('x1', xv);
+    crosshair.setAttribute('x2', xv);
+    crosshair.setAttribute('visibility', 'visible');
+    document.getElementById('stDate').textContent = new Date(p[0] * 1000).toLocaleString('en-GB', {{ day: 'numeric', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit', timeZone: 'UTC' }}) + ' UTC';
+    document.getElementById('stCalc').textContent = p[1].toFixed(6);
+    document.getElementById('stRec').textContent = recordedAt(p[0]).toFixed(6);
+    var cx = xv / 840 * box.width, w = tooltip.offsetWidth || 160;
+    tooltip.style.left = Math.max(w / 2, Math.min(box.width - w / 2, cx)) + 'px';
+    tooltip.style.visibility = 'visible';
+  }}
+  rect.addEventListener('pointermove', show);
+  rect.addEventListener('pointerdown', show);
+  rect.addEventListener('pointerleave', function() {{
+    crosshair.setAttribute('visibility', 'hidden');
+    tooltip.style.visibility = 'hidden';
+  }});
+}})();
+</script>'''
+
+market_url = "https://app.morpho.org/ethereum/market/0xfb7d54e0ce71efc8fffd3f4e1db0afa9265882da5cc76604b62adfac64501e80/lseth-usdc"
 debank_url = f"https://debank.com/profile/{wallet}"
-# Phase 1 carry backtest -- public Dune query behind the 2.11% cross-check.
-backtest_url = "https://dune.com/queries/8163239"
+# The visible stamp keeps the YYYY-MM-DD HH:MM UTC shape: refresh.yml masks
+# exactly that pattern when deciding whether the data moved.
 as_of = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 built_epoch = int(datetime.now(timezone.utc).timestamp())
 # Deep link to the workflow's own Run button. A real in-page trigger would need a
@@ -421,11 +648,521 @@ built_epoch = int(datetime.now(timezone.utc).timestamp())
 # where the click is authenticated as whoever is signed in.
 actions_url = "https://github.com/kpk-labs/upshift-lseth-dashboard/actions/workflows/refresh.yml"
 
-html = f"""<!doctype html>
+
+def ext(url, text):
+    return f'<a href="{esc(url)}" target="_blank" rel="noopener">{text}</a>'
+
+
+def addr(a, text):
+    return ext(f"{ETHERSCAN}/address/{a}", text)
+
+
+# --- Page pieces --------------------------------------------------------------------------------
+
+def scope_cards():
+    return "".join(
+        f'<div class="scope-card"><div class="scope-head"><div class="stat-label">{esc(c["label"])}</div>{icon(c.get("icon", ""), 26)}</div>'
+        f'<div class="scope-value">{esc(c["value"])}</div><div class="stat-sub">{T(c["detail"])}</div></div>'
+        for c in CONFIG["scope"]["cards"])
+
+
+deposit_chips = "".join(
+    f'<span class="chip" style="text-transform:none">{icon(a.get("icon", ""), 16)}{esc(a["asset"])}</span>' for a in CONFIG["deposit_assets"])
+
+basis_toggle = ('<span class="view-toggle" role="group" aria-label="Spread basis">' + "".join(
+    f'<button type="button" data-basis="{k}" aria-pressed="{"true" if k == _default_basis else "false"}">{esc(b["label"])}</button>'
+    for k, b in bases.items()) + "</span>")
+
+spread_buttons = "".join(
+    f'<button type="button" class="spread-btn" data-basis="{k}" aria-current="{"true" if k == _default_basis else "false"}">'
+    f'<i>{esc(b["label"])}</i><b>{sgn(b["spread"])} pp</b></button>'
+    for k, b in bases.items())
+
+
+def mini(label, value, sub):
+    return f'<div class="mini"><span class="m-label">{label}<em>{sub}</em></span><span class="m-value">{value}</span></div>'
+
+
+if lseth_apy is not None:
+    total_row = mini("Total APY on ETH", f'<span id="totalApy">{lseth_apy + carry_head:.2f}%</span>',
+                     f'{lseth_apy:.2f}% staking + <span id="carryPart">{carry_head:.2f}</span>% carry')
+else:
+    # The staking leg comes from DefiLlama (Morpho serves null for it); if that
+    # fetch failed, show LLTV rather than invent a staking rate.
+    total_row = mini("Liquidation LTV (LLTV)", f"{lltv:.1f}%", "on the LsETH/USDC market")
+hero_side = "".join([
+    total_row,
+    mini("Spread", f'<span id="spreadTop">{sgn(B0["spread"])} pp</span>',
+         f'vault yield minus borrow rate, <span id="spreadBasisTop">{esc(basis_word(B0["label"]))}</span>'),
+    mini("Health factor · LTV", f"{hf_now:.3f} · {ltv:.1f}%" if hf_now else f"no debt · {ltv:.1f}%",
+         f"today · band {V['repay_below']} to {V['borrow_above']}" + (f" · liquidation at ≈ {money(liq_px)}" if liq_px else "")),
+    mini("Position", f"{coll['amount']:,.2f} LsETH",
+         f"≈ {money(coll['usd'])} collateral · {borrow['amount']:,.0f} USDC borrowed"),
+])
+
+fee_term = f"{net_fee_multiplier:g}"
+fee_sub = f"after {PERF_FEE * 100:.0f}% fee"
+math_strip = (
+    f'<div class="math">'
+    f'<div class="chunk"><span class="term" id="mathYield">{B0["yield"]:.2f}%</span><span class="sub" id="mathYieldSub">vault yield, {esc(basis_word(B0["label"]))}</span></div><span class="op">-</span>'
+    f'<div class="chunk"><span class="term" id="mathBorrow">{B0["borrow"]:.2f}%</span><span class="sub" id="mathBorrowSub">borrow, {esc(basis_word(B0["label"]))}</span></div><span class="op">=</span>'
+    f'<div class="chunk"><span class="term" id="mathDelta">{sgn(B0["spread"])} pp</span><span class="sub">spread</span></div><span class="op">×</span>'
+    f'<div class="chunk"><span class="term" id="mathLtv">{ltv:.1f}%</span><span class="sub">LTV, today</span></div><span class="op">×</span>'
+    f'<div class="chunk"><span class="term">{fee_term}</span><span class="sub">{fee_sub}</span></div><span class="op">=</span>'
+    f'<div class="chunk"><span class="term good" id="mathCarry">{sgn(carry_head)}%</span><span class="sub">carry on LsETH</span></div>'
+    f'</div>')
+
+SN = CONFIG.get("status_note") or {}
+status_note = (f'<div class="status-note"><b>{T(SN["title"])}.</b> {T(SN["text"])}</div>'
+               if SN.get("text") else "")
+BT = CONFIG["backtest"]
+backtest_fold = (f'<div class="card"><details class="fold"><summary>{esc(BT["summary"])}</summary>'
+                 f'<p class="lede">{esc(BT["text"])} {ext(DOCS["backtest_query"], "Query ↗")}</p></details></div>')
+
+vault_rows = "".join(
+    f'<div class="kv"><span>{ext("https://app.morpho.org/ethereum/vault/" + v["address"], esc("Yield RWA" if "RWA" in v["vault"] else "Yield") + " ↗")} '
+    f'<span class="dim">{v["weight"] * 100:.0f}%</span></span><span class="mono">{v["apy_pct"]:.2f}%</span></div>'
+    for v in sorted(_vaults, key=lambda v: "RWA" in v["vault"]))
+
+legend = (
+    '<div class="legend">'
+    '<span><i style="border-top-color:var(--c-borrow)"></i>Borrow APY · LsETH/USDC</span>'
+    '<span><i style="border-top-color:var(--c-yield)"></i>KPK USDC Yield</span>'
+    + ('<span><i style="border-top-color:var(--c-rwa)"></i>KPK USDC Yield RWA</span>' if hist.get("rwa_apy_pct") else "")
+    + '<span><i class="dash"></i>KPK USDC Yield · 30-day trend</span>'
+    '</div>')
+
+# Slider track: green up to the target LTV, orange by the repay trigger, red on to liquidation.
+_g_good = TARGET_LTV / lltv * 100
+_g_warn = BAND["hi"] / lltv * 100
+_g_bad = (BAND["hi"] + (lltv - BAND["hi"]) / 2) / lltv * 100
+slider_bg = (f"background: linear-gradient(to right, var(--c-good) 0%, var(--c-good) {_g_good:.1f}%, "
+             f"var(--kpk-orange-500) {_g_warn:.1f}%, var(--c-bad) {_g_bad:.1f}%, var(--c-bad) 100%)")
+
+sim = {
+    "bases": {k: {kk: (round(vv, 6) if isinstance(vv, float) else vv) for kk, vv in b.items()} for k, b in bases.items()},
+    "basis": _default_basis,
+    "liveLtv": round(ltv, 4),
+    "lltv": lltv,
+    "fee": PERF_FEE,
+    "staking": round(lseth_apy, 6) if lseth_apy is not None else None,
+    "px": round(lseth_price, 4),
+    "target": TARGET_LTV,
+    "band": {k: round(v, 4) for k, v in BAND.items()},
+}
+
+# --- How we manage risk (all copy from config.json) ---------------------------------------------
+
+RISK = CONFIG["risk"]
+_SVG = '<svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
+PERM_ICONS = {
+    "users": _SVG + '<circle cx="9" cy="8" r="3.2"/><path d="M3 20c.5-3.6 3-5.6 6-5.6s5.5 2 6 5.6"/><circle cx="17" cy="9" r="2.6"/><path d="M16.2 14.4c2.6 0 4.5 1.8 4.9 5.1"/></svg>',
+    "shield": _SVG + '<path d="M12 3l8 3v6c0 4.5-3.4 8.2-8 9-4.6-.8-8-4.5-8-9V6z"/><path d="M8.5 12l2.5 2.5 4.5-5"/></svg>',
+    "sign": _SVG + '<path d="M4 20h16"/><path d="M15 4.5l4.5 4.5L9 19.5H4.5V15z"/></svg>',
+}
+LINK_LABELS = {"nav_calculator": "NAV Calculator ↗"}
+
+
+def chips(items):
+    return "".join(f'<span class="chip-s">{T(x)}</span>' for x in items)
+
+
+def risk_section():
+    flow = '<span class="rf-arrow" aria-hidden="true">→</span>'.join(
+        f'<div class="rf-step"><div class="rf-n">{i}</div><div class="rf-t">{T(a)}</div><div class="rf-b">{T(b)}</div></div>'
+        for i, (a, b) in enumerate(RISK["steps"], start=1))
+    watch = "".join(
+        f'<div class="card watch"><div class="watch-head">{icon(w["icon"], 24)}<div><div class="stat-label">{T(w["title"])}</div>'
+        f'<div class="stat-sub">{T(w["sub"])}</div></div></div><div class="chips">{chips(w["items"])}</div>'
+        + "".join(f'<div class="wakes"><div class="wakes-t">{T(lst["title"])}</div>'
+                  + "".join(f'<div class="wake">{T(x)}</div>' for x in lst["items"]) + "</div>" for lst in w["lists"])
+        + "</div>" for w in RISK["watch"])
+    la, lh = RISK["layers"]["auto"], RISK["layers"]["human"]
+    layers = (
+        f'<div class="grid g2">'
+        f'<div class="card layer"><div class="layer-tag auto">{T(la["tag"])}</div><div class="layer-t">{T(la["title"])}</div><p class="agent-b">{T(la["body"])}</p></div>'
+        f'<div class="card layer"><div class="layer-tag human">{T(lh["tag"])}</div><div class="layer-t">{T(lh["title"])}</div><p class="agent-b">{T(lh["body"])}</p>'
+        f'<div class="chips">{chips(lh.get("chips", []))}</div></div></div>')
+    agents = "".join(
+        f'<details class="card agent"><summary><span class="stat-label">{T(a["name"])}</span><span class="agent-s">{T(a["short"])}</span></summary>'
+        f'<p class="agent-b">{T(a["body"])}'
+        + (f' {addr(CONTRACTS[a["link"]], LINK_LABELS[a["link"]])}' if a.get("link") else "")
+        + "</p></details>" for a in RISK["agents"])
+    perms = "".join(
+        f'<div class="card perm"><div class="perm-h">{PERM_ICONS[p["icon"]]}<span>{T(p["title"])}</span></div>'
+        f'<p class="agent-b">{T(p["body"])}'
+        + (f' Detail in the docs: {ext(DOCS["governance"], "Governance and controls ↗")}.' if p.get("docs_link") else "")
+        + "</p></div>" for p in RISK["permissions"])
+    return f"""
+<section id="risk">
+  <span class="label">How we manage risk</span>
+  <h2>{T(RISK['title'])}</h2>
+  <p class="lede">{T(RISK['lede'])}</p>
+  <div class="doc-links">{ext(DOCS['automation'], 'How KPK automation works ↗')}{ext(DOCS['risk_framework'], 'KPK Risk Framework ↗')}{ext(DOCS['governance'], 'Governance and controls ↗')}</div>
+  <div class="riskflow">{flow}</div>
+  <div class="sub-h">What is watched</div>
+  <div class="grid g3">{watch}</div>
+  <div class="stat-sub" style="margin-top:-6px">Agent settings as set on {esc(RISK['as_of'])}.</div>
+  <div class="sub-h">How a signal is handled</div>
+  {layers}
+  <div class="sub-h">The agents</div>
+  <div class="grid g3">{agents}</div>
+  <div class="sub-h">Onchain permissions</div>
+  <div class="grid g3">{perms}</div>
+</section>
+"""
+
+
+TERMS = CONFIG["terms"]
+terms_tiles = "".join(
+    f'<div class="redeem-tile{" strong" if t.get("strong") else ""}"><div class="redeem-v">{esc(t["value"])}</div><div class="redeem-k">{esc(t["detail"])}</div></div>'
+    for t in TERMS["tiles"])
+terms_rows = "".join(f'<div class="kv"><span>{esc(k)}</span><span>{esc(v)}</span></div>' for k, v in TERMS["rows"])
+
+# --- CSS and JS (plain strings: no em dashes, tokens only) -------------------------------------
+
+CSS = """
+:root {
+  --c-line: #2E7FC1; --c-liq: #D2553A; --c-band: #2D8C6A;
+  --c-band-fill: rgba(45, 140, 106, 0.12); --c-good: #2D8C6A; --c-bad: #D2553A; --c-info: #2E7FC1;
+  --c-warn: #B8741A; --c-borrow: #2E7FC1; --c-yield: #DC5C39; --c-rwa: #22676D;
+}
+:root[data-theme="dark"] { --c-line: #3F93D4; --c-liq: #DD6447; --c-band: #35A578; --c-band-fill: rgba(53, 165, 120, 0.16); --c-good: #35A578; --c-bad: #DD6447; --c-info: #3F93D4; --c-warn: #E8973F; --c-borrow: #3F93D4; --c-yield: #E2724F; --c-rwa: #4DBEC8; }
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) { DARK_TOKENS --c-line: #3F93D4; --c-liq: #DD6447; --c-band: #35A578; --c-band-fill: rgba(53, 165, 120, 0.16); --c-good: #35A578; --c-bad: #DD6447; --c-info: #3F93D4; --c-warn: #E8973F; --c-borrow: #3F93D4; --c-yield: #E2724F; --c-rwa: #4DBEC8; }
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
+body { background: var(--kpk-surface); color: var(--kpk-ink); font-family: var(--kpk-font-sans); font-weight: 400; line-height: 1.5; -webkit-font-smoothing: antialiased; }
+a { color: inherit; text-decoration-color: var(--kpk-ink-faint); text-underline-offset: 2px; }
+.page { max-width: 1040px; margin: 0 auto; padding: var(--kpk-space-6) var(--kpk-space-4) var(--kpk-space-16); display: flex; flex-direction: column; gap: var(--kpk-space-8); }
+header.top { display: flex; align-items: center; justify-content: space-between; gap: var(--kpk-space-4); flex-wrap: wrap; }
+.logo { width: 84px; color: var(--kpk-ink); }
+.logo svg { width: 100%; height: auto; display: block; }
+.meta { display: flex; gap: var(--kpk-space-3); align-items: center; flex-wrap: wrap; font-size: var(--kpk-text-fs-meta); color: var(--kpk-ink-muted); }
+.asof.stale { color: var(--c-bad); font-weight: 500; }
+.theme-btn { font: inherit; font-size: var(--kpk-text-fs-meta); color: var(--kpk-ink-muted); background: none; border: var(--kpk-rule-hard) solid var(--kpk-line); border-radius: var(--kpk-radius-pill); padding: 2px 10px; cursor: pointer; }
+.hero h1 { font-size: var(--kpk-text-display-h1); font-weight: 500; letter-spacing: -0.01em; margin: 0 0 var(--kpk-space-3); line-height: 1.1; }
+.hero p { font-size: var(--kpk-text-body); max-width: 70ch; margin: 0 0 var(--kpk-space-4); }
+.hero .row { display: flex; gap: var(--kpk-space-3); flex-wrap: wrap; align-items: center; }
+@media (max-width: 640px) { .hero h1 { font-size: 34px; } .hero p { font-size: 15px; } }
+.cta { display: inline-flex; align-items: center; gap: 8px; background: var(--kpk-ink); color: var(--kpk-surface); text-decoration: none; padding: 10px 18px; border-radius: var(--kpk-radius-pill); font-weight: 500; font-size: var(--kpk-text-body-small); }
+.cta:hover { opacity: 0.9; }
+.cta.ghost { background: transparent; color: var(--kpk-ink); border: var(--kpk-rule-hard) solid var(--kpk-line-strong); }
+.chip { display: inline-flex; align-items: center; gap: 6px; font-size: var(--kpk-text-fs-tag); letter-spacing: 0.04em; text-transform: uppercase; padding: 3px 9px; border-radius: var(--kpk-radius-tag); border: var(--kpk-rule-hard) solid var(--kpk-line-strong); }
+.pill { display: inline-block; font-size: var(--kpk-text-fs-tag); letter-spacing: 0.04em; text-transform: uppercase; padding: 3px 9px; border-radius: var(--kpk-radius-tag); background: var(--kpk-pill); color: var(--kpk-ink); vertical-align: middle; }
+section { display: flex; flex-direction: column; gap: var(--kpk-space-4); scroll-margin-top: var(--kpk-space-4); }
+.label { align-self: flex-start; background: var(--kpk-label-bg); color: var(--kpk-label-ink); font-size: var(--kpk-text-label); font-weight: 500; letter-spacing: 0.08em; text-transform: uppercase; padding: 3px 9px; border-radius: var(--kpk-radius-tag); }
+h2 { font-size: var(--kpk-text-fs-section); font-weight: 500; margin: 0; letter-spacing: -0.01em; line-height: 1.2; }
+@media (max-width: 640px) { h2 { font-size: 24px; } }
+.lede { color: var(--kpk-ink-muted); font-size: var(--kpk-text-body-small); max-width: 80ch; margin: 0; }
+.asof-note { font-size: var(--kpk-text-fs-meta); color: var(--kpk-ink-muted); }
+.note { font-size: var(--kpk-text-body-small); border: var(--kpk-rule-hard) solid var(--c-bad); border-radius: var(--kpk-radius-label); padding: 10px 14px; }
+.status-note { font-size: var(--kpk-text-body-small); background: var(--kpk-surface-card); border: var(--kpk-rule-hard) solid var(--kpk-line); border-left: 3px solid var(--c-good); border-radius: var(--kpk-radius-label); padding: 12px 16px; line-height: 1.55; }
+.status-note b { font-weight: 500; }
+.card { background: var(--kpk-surface-card); border: var(--kpk-rule-hard) solid var(--kpk-line); border-radius: var(--kpk-radius-card); padding: var(--kpk-space-6); min-width: 0; }
+@media (max-width: 640px) { .card { padding: var(--kpk-space-4); } }
+.grid { display: grid; gap: var(--kpk-space-4); }
+.g3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.g2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+@media (max-width: 760px) { .g3, .g2 { grid-template-columns: 1fr; } }
+.stat-label { font-size: var(--kpk-text-label); letter-spacing: 0.08em; text-transform: uppercase; color: var(--kpk-ink-muted); font-weight: 500; }
+.stat-value { font-size: var(--kpk-text-fs-stat); font-weight: 500; letter-spacing: -0.02em; line-height: 1.1; margin: 6px 0 4px; font-variant-numeric: tabular-nums; }
+.stat-value.good, .term.good { color: var(--c-good); }
+.stat-value.bad, .term.bad { color: var(--c-bad); }
+.muted { color: var(--kpk-ink-muted); }
+.stat-sub { font-size: var(--kpk-text-fs-meta); color: var(--kpk-ink-muted); margin-top: 4px; }
+.kv { display: flex; justify-content: space-between; gap: 12px; font-size: var(--kpk-text-body-small); padding: 6px 0; border-top: var(--kpk-rule-soft) solid var(--kpk-line); flex-wrap: wrap; }
+.kv:first-of-type { margin-top: 8px; }
+.kv > span:last-child { margin-left: auto; text-align: right; }
+.mono { font-family: var(--kpk-font-mono); font-size: var(--kpk-text-data-mono); }
+.dim { color: var(--kpk-ink-muted); }
+.nowrap { white-space: nowrap; }
+.math { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; font-size: var(--kpk-text-body-small); }
+.math .chunk { display: flex; flex-direction: column; align-items: center; }
+.math .term { font-weight: 500; font-family: var(--kpk-font-mono); font-size: 16px; }
+.math .sub { font-size: var(--kpk-text-fs-tag); color: var(--kpk-ink-muted); }
+.math .op { color: var(--kpk-ink-muted); }
+.flow { display: grid; grid-template-columns: 1fr auto 1fr auto 1fr; gap: 12px; align-items: stretch; }
+.flow .arrow { align-self: center; color: var(--kpk-ink-muted); font-size: 20px; }
+@media (max-width: 760px) { .flow { grid-template-columns: 1fr; } .flow .arrow { transform: rotate(90deg); justify-self: center; } }
+.leg { display: flex; flex-direction: column; }
+.leg-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.leg-kind { font-size: var(--kpk-text-label); letter-spacing: 0.08em; text-transform: uppercase; font-weight: 500; color: var(--kpk-ink-muted); }
+.leg-amount { font-size: 22px; font-weight: 500; margin: 4px 0 6px; font-variant-numeric: tabular-nums; }
+.leg .kv:first-of-type { margin-top: 0; }
+.logo-icon { border-radius: 50%; flex: none; display: inline-block; vertical-align: middle; }
+.logo-icon.sq { border-radius: 22%; }
+.scope { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; margin-top: var(--kpk-space-6); }
+@media (max-width: 760px) { .scope { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 440px) { .scope { grid-template-columns: 1fr; } }
+.scope-card { background: var(--kpk-surface-card); border: var(--kpk-rule-hard) solid var(--kpk-line); border-radius: var(--kpk-radius-card); padding: 12px 14px; min-width: 0; }
+.scope-value { font-size: 17px; font-weight: 500; margin: 4px 0 2px; }
+.scope-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; }
+.doc-links { display: flex; gap: 10px; flex-wrap: wrap; }
+.doc-links a { font-size: var(--kpk-text-fs-meta); padding: 4px 10px; border: var(--kpk-rule-hard) solid var(--kpk-line); border-radius: var(--kpk-radius-pill); text-decoration: none; }
+.doc-links a:hover { border-color: var(--kpk-line-strong); }
+.sub-h { font-size: var(--kpk-text-label); letter-spacing: 0.08em; text-transform: uppercase; color: var(--kpk-ink-muted); font-weight: 500; margin: 6px 0 -6px; }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+.chip-s { font-size: var(--kpk-text-fs-tag); padding: 3px 8px; border-radius: var(--kpk-radius-pill); background: var(--kpk-pill); color: var(--kpk-ink); line-height: 1.4; }
+.pill.live-pill { background: var(--c-band-fill); color: var(--c-good); }
+.view-toggle { display: inline-flex; gap: 4px; margin-left: 8px; vertical-align: middle; flex-wrap: wrap; }
+.view-toggle button { font: inherit; font-size: var(--kpk-text-fs-tag); letter-spacing: 0.05em; text-transform: uppercase; padding: 3px 9px; border-radius: var(--kpk-radius-pill); border: var(--kpk-rule-hard) solid var(--kpk-line); background: transparent; color: var(--kpk-ink-muted); cursor: pointer; }
+.view-toggle button[aria-pressed="true"] { background: var(--c-band-fill); color: var(--c-good); border-color: var(--c-good); }
+.watch-head { display: flex; gap: 10px; align-items: flex-start; }
+.wakes { margin-top: 12px; padding-top: 10px; border-top: var(--kpk-rule-soft) solid var(--kpk-line); }
+.wakes-t { font-size: var(--kpk-text-fs-tag); color: var(--kpk-ink-muted); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 6px; }
+.wake { font-size: var(--kpk-text-fs-meta); padding: 4px 0 4px 10px; border-left: 2px solid var(--c-band); margin-bottom: 4px; }
+.layer-tag { display: inline-block; font-size: var(--kpk-text-fs-tag); letter-spacing: 0.05em; text-transform: uppercase; padding: 3px 9px; border-radius: var(--kpk-radius-tag); }
+.layer-tag.auto { background: var(--c-band-fill); color: var(--c-good); border: var(--kpk-rule-hard) solid var(--c-good); }
+.layer-tag.human { background: var(--kpk-pill); color: var(--kpk-ink); }
+.layer-t { font-size: 18px; font-weight: 500; margin: 10px 0 0; }
+details.agent > summary { cursor: pointer; list-style: none; display: flex; flex-direction: column; gap: 4px; }
+details.agent > summary::-webkit-details-marker { display: none; }
+details.agent > summary::after { content: "Show more"; font-size: var(--kpk-text-fs-tag); color: var(--kpk-ink-muted); text-decoration: underline; margin-top: 4px; }
+details.agent[open] > summary::after { content: "Show less"; }
+.agent-s { font-size: 15px; font-weight: 500; }
+.agent-b { font-size: var(--kpk-text-body-small); margin: 8px 0 0; line-height: 1.55; }
+.riskflow { display: grid; grid-template-columns: 1fr auto 1fr auto 1fr auto 1fr; gap: 10px; align-items: stretch; }
+.rf-step { background: var(--kpk-surface-card); border: var(--kpk-rule-hard) solid var(--kpk-line); border-radius: var(--kpk-radius-card); padding: 14px 16px; }
+.rf-n { width: 22px; height: 22px; border-radius: 50%; background: var(--kpk-ink); color: var(--kpk-surface); font-size: 12px; font-weight: 500; display: flex; align-items: center; justify-content: center; }
+.rf-t { font-weight: 500; margin: 8px 0 4px; }
+.rf-b { font-size: var(--kpk-text-fs-meta); color: var(--kpk-ink-muted); line-height: 1.5; }
+.rf-arrow { align-self: center; color: var(--kpk-ink-muted); font-size: 20px; }
+@media (max-width: 860px) { .riskflow { grid-template-columns: 1fr; } .rf-arrow { transform: rotate(90deg); justify-self: center; } }
+.perm-h { display: flex; gap: 10px; align-items: center; font-weight: 500; font-size: 16px; color: var(--kpk-ink); }
+.perm-h svg { color: var(--c-good); flex: none; }
+.redeem { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 10px; }
+@media (max-width: 480px) { .redeem { grid-template-columns: 1fr; } }
+.redeem-tile { border: var(--kpk-rule-hard) solid var(--kpk-line); border-radius: var(--kpk-radius-label); padding: 12px 14px; }
+.redeem-tile.strong { border-color: var(--c-good); background: var(--c-band-fill); }
+.redeem-v { font-size: 22px; font-weight: 500; }
+.redeem-tile.strong .redeem-v { color: var(--c-good); }
+.redeem-k { font-size: var(--kpk-text-fs-meta); color: var(--kpk-ink-muted); margin-top: 4px; }
+.headline { display: grid; grid-template-columns: 1.3fr 1fr; gap: var(--kpk-space-4); align-items: start; }
+@media (max-width: 760px) { .headline { grid-template-columns: 1fr; } }
+.hero-value { font-size: var(--kpk-text-slide-stat); margin: 10px 0 8px; }
+@media (max-width: 640px) { .hero-value { font-size: 52px; } }
+.stat-note { font-size: var(--kpk-text-body-small); color: var(--kpk-ink-muted); max-width: 52ch; }
+.stat-note b { color: var(--kpk-ink); font-weight: 500; }
+.side-stats { display: flex; flex-direction: column; background: var(--kpk-surface-card); border: var(--kpk-rule-hard) solid var(--kpk-line); border-radius: var(--kpk-radius-card); padding: 4px 18px; }
+.mini { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; padding: 8px 0; }
+.mini + .mini { border-top: var(--kpk-rule-soft) solid var(--kpk-line); }
+.m-label { font-size: var(--kpk-text-body-small); color: var(--kpk-ink-muted); font-weight: 500; }
+.m-label em { display: block; font-style: normal; font-weight: 400; font-size: var(--kpk-text-fs-tag); margin-top: 2px; }
+.m-value { font-size: 20px; font-weight: 500; font-variant-numeric: tabular-nums; white-space: nowrap; }
+details.fold > summary { cursor: pointer; font-size: var(--kpk-text-body-small); font-weight: 500; }
+details.fold[open] > summary { margin-bottom: 10px; }
+.legend { display: flex; gap: 18px; flex-wrap: wrap; font-size: var(--kpk-text-fs-meta); color: var(--kpk-ink-muted); align-items: center; margin-top: 10px; }
+.legend i { display: inline-block; width: 16px; height: 0; border-top: 2px solid var(--c-line); vertical-align: middle; margin-right: 6px; }
+.legend i.dash { border-top: 1.5px dashed var(--c-yield); }
+.chart { position: relative; margin-top: 10px; }
+.chart-svg { width: 100%; height: auto; display: block; overflow: visible; touch-action: pan-y; }
+.chart-svg text { font-family: var(--kpk-font-sans); fill: var(--kpk-ink-muted); font-size: 12px; }
+.chart-grid { stroke: var(--kpk-line); stroke-width: 1; }
+.chart-endlabel { font-size: 12px; font-weight: 500; }
+.chart-crosshair { stroke: var(--kpk-ink-muted); stroke-width: 1; }
+.chart-annot text { font-size: 11px; }
+.risk-list { display: flex; flex-direction: column; }
+.risk-row { display: grid; grid-template-columns: 160px 1fr 1.3fr; gap: 14px; padding: 10px 0; border-top: var(--kpk-rule-soft) solid var(--kpk-line); font-size: var(--kpk-text-body-small); }
+.risk-row:first-child { border-top: 0; padding-top: 0; }
+.risk-n { font-weight: 500; }
+.risk-h { color: var(--kpk-ink-muted); padding-left: 10px; border-left: 2px solid var(--c-band); }
+@media (max-width: 760px) { .risk-row { grid-template-columns: 1fr; gap: 4px; } }
+.chart-mark { stroke: var(--kpk-ink-faint); stroke-width: 1.2; stroke-dasharray: 5 3; }
+.chart-svg text.chart-marklabel { font-size: 11px; }
+@media (max-width: 640px) {
+  .chart { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  .chart-svg { min-width: 720px; }
+  .chart-svg text { font-size: 14px; }
+}
+.chart-tooltip { position: absolute; top: 0; pointer-events: none; visibility: hidden; background: var(--kpk-sheet); border: var(--kpk-rule-hard) solid var(--kpk-line-strong); border-radius: var(--kpk-radius-label); padding: 8px 10px; font-size: 12px; white-space: nowrap; transform: translate(-50%, 12px); z-index: 3; min-width: 150px; }
+.chart-tooltip .date { color: var(--kpk-ink-muted); margin-bottom: 3px; }
+.chart-tooltip .row { display: flex; align-items: center; gap: 6px; }
+.chart-tooltip .key { width: 10px; height: 2px; border-radius: 2px; display: inline-block; }
+.chart-tooltip .val { font-weight: 500; font-variant-numeric: tabular-nums; margin-left: auto; padding-left: 10px; }
+.table-scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; max-height: 420px; overflow-y: auto; }
+table.data { border-collapse: collapse; width: 100%; font-size: var(--kpk-text-body-small); }
+table.data th, table.data td { text-align: left; padding: 8px 10px; border-bottom: var(--kpk-rule-soft) solid var(--kpk-line); vertical-align: top; }
+table.data th { font-size: var(--kpk-text-label); letter-spacing: 0.06em; text-transform: uppercase; color: var(--kpk-ink-muted); font-weight: 500; position: sticky; top: 0; background: var(--kpk-surface-card); }
+table.data .num { text-align: right; font-variant-numeric: tabular-nums; }
+.sim-head { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+.sim-head > div:first-child { flex: 1 1 420px; }
+.sim-head .lede { margin-top: 6px; }
+.sim-out { display: flex; align-items: baseline; gap: 10px; }
+.sim-out .big { font-size: 36px; font-weight: 500; color: var(--c-good); font-variant-numeric: tabular-nums; }
+.sim-out .big.neg { color: var(--c-bad); }
+.slider-wrap { margin-top: 18px; }
+.spread-picker { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 16px; }
+.picker-label { font-size: var(--kpk-text-fs-meta); color: var(--kpk-ink-muted); margin-right: 2px; }
+.spread-btn { display: flex; flex-direction: column; align-items: flex-start; gap: 1px; padding: 6px 11px; border: var(--kpk-rule-hard) solid var(--kpk-line); border-radius: var(--kpk-radius-label); background: var(--kpk-surface); color: var(--kpk-ink-muted); font: inherit; cursor: pointer; text-align: left; }
+.spread-btn i { font-style: normal; font-size: var(--kpk-text-fs-tag); letter-spacing: 0.03em; }
+.spread-btn b { font-size: 13px; font-weight: 500; font-variant-numeric: tabular-nums; }
+.spread-btn[aria-current="true"] { border-color: var(--c-good); color: var(--kpk-ink); }
+.spread-btn[aria-current="true"] b { color: var(--c-good); }
+.picker-note { flex: 1 1 100%; font-size: var(--kpk-text-fs-tag); color: var(--kpk-ink-muted); }
+.ends { display: flex; justify-content: space-between; font-size: var(--kpk-text-fs-tag); color: var(--kpk-ink-muted); margin-bottom: 6px; }
+.ends .hi { color: var(--c-bad); }
+input[type=range] { width: 100%; -webkit-appearance: none; appearance: none; height: 6px; border-radius: 4px; outline: none; margin: 0; }
+input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 22px; height: 22px; border-radius: 50%; background: var(--kpk-ink); border: 3px solid var(--kpk-surface-card); cursor: pointer; }
+input[type=range]::-moz-range-thumb { width: 22px; height: 22px; border-radius: 50%; background: var(--kpk-ink); border: 3px solid var(--kpk-surface-card); cursor: pointer; }
+.marks { position: relative; height: 88px; margin-top: 4px; }
+.band-seg { position: absolute; top: 0; height: 8px; background: var(--c-band-fill); border: var(--kpk-rule-hard) dashed var(--c-band); border-radius: 4px; }
+.band-seg span { position: absolute; top: 10px; left: 50%; transform: translateX(-50%); font-size: var(--kpk-text-fs-tag); color: var(--c-band); white-space: nowrap; }
+.band-seg.end span { left: auto; right: 0; transform: none; }
+.marks button { position: absolute; transform: translateX(-50%); background: none; border: 0; padding: 2px 4px; font: inherit; font-size: var(--kpk-text-fs-tag); color: var(--kpk-ink-muted); cursor: pointer; white-space: nowrap; }
+.marks button::before { content: ""; display: block; width: 7px; height: 7px; border-radius: 50%; border: 1.5px solid var(--kpk-ink-muted); margin: 0 auto 3px; }
+.marks button.end { transform: translateX(calc(-100% + 7.5px)); text-align: right; }
+.marks button.end::before { margin: 0 0 3px auto; }
+.marks button.on { color: var(--kpk-ink); font-weight: 500; }
+.marks button.on::before { background: var(--kpk-ink); border-color: var(--kpk-ink); }
+.sim-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-top: 16px; }
+.sim-grid.three { grid-template-columns: repeat(3, minmax(0, 1fr)); margin-top: 12px; }
+@media (max-width: 760px) { .sim-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .sim-grid.three { grid-template-columns: 1fr; } }
+.sim-cell { border: var(--kpk-rule-hard) solid var(--kpk-line); border-radius: var(--kpk-radius-label); padding: 10px 12px; min-width: 0; }
+.sim-cell .k { font-size: var(--kpk-text-fs-tag); color: var(--kpk-ink-muted); text-transform: uppercase; letter-spacing: 0.04em; }
+.sim-cell .v { font-size: 17px; font-weight: 500; margin-top: 2px; font-variant-numeric: tabular-nums; }
+.sim-cell.t-good { border-color: var(--c-good); background: var(--c-band-fill); }
+.sim-cell.t-good .v { color: var(--c-good); }
+.sim-cell.t-warn { border-color: var(--c-warn); }
+.sim-cell.t-warn .v { color: var(--c-warn); }
+.sim-cell.t-bad { border-color: var(--c-bad); }
+.sim-cell.t-bad .v { color: var(--c-bad); }
+.sim-cell.t-none .v { color: var(--kpk-ink-muted); }
+footer { border-top: var(--kpk-rule-hard) solid var(--kpk-line-strong); padding-top: var(--kpk-space-4); font-size: var(--kpk-text-fs-footer); color: var(--kpk-ink-muted); display: flex; flex-direction: column; gap: 8px; }
+footer p { margin: 0; max-width: 100ch; }
+footer b { font-weight: 500; color: var(--kpk-ink); }
+a:focus-visible, button:focus-visible, input:focus-visible { outline: 2px solid var(--c-info); outline-offset: 2px; }
+""".replace("DARK_TOKENS", dark_block)
+
+JS = """
+(function () {
+  var root = document.documentElement;
+  try { var saved = localStorage.getItem('lseth-carry-theme'); if (saved) root.setAttribute('data-theme', saved); } catch (e) {}
+  var btn = document.getElementById('themeBtn');
+  function label() { var t = root.getAttribute('data-theme'); btn.textContent = t === 'dark' ? 'Dark' : t === 'light' ? 'Light' : 'Auto'; }
+  if (btn) {
+    label();
+    btn.addEventListener('click', function () {
+      var t = root.getAttribute('data-theme'), next = t === 'light' ? 'dark' : t === 'dark' ? null : 'light';
+      if (next) root.setAttribute('data-theme', next); else root.removeAttribute('data-theme');
+      try { if (next) localStorage.setItem('lseth-carry-theme', next); else localStorage.removeItem('lseth-carry-theme'); } catch (e) {}
+      label();
+    });
+  }
+  // The page is static: the build stamps when it ran; the browser adds how old that is now.
+  var el = document.getElementById('asOf');
+  if (el) {
+    var built = parseInt(el.getAttribute('data-built'), 10), mins = Math.floor((Date.now() / 1000 - built) / 60);
+    if (mins >= 0) {
+      el.textContent += ' · ' + (mins < 60 ? mins + ' min ago' : mins < 1440 ? Math.floor(mins / 60) + ' h ago' : Math.floor(mins / 1440) + ' days ago');
+      if (mins > 300) el.classList.add('stale');  // >5h: the 4-hourly rebuild slipped
+    }
+  }
+
+  var S = window.SIM, slider = document.getElementById('ltvSlider');
+  if (!S || !slider) return;
+  var cur = S.basis;
+  function $(id) { return document.getElementById(id); }
+  function set(id, txt) { var e = $(id); if (e) e.textContent = txt; }
+  function sg(x) { return (x >= 0 ? '+' : '') + x.toFixed(2); }
+  function money(x) { return (x < 0 ? '-$' : '$') + Math.abs(x).toLocaleString('en-US', { maximumFractionDigits: 0 }); }
+  // Carry = spread x LTV x (1 - fee), with the spread held at the chosen basis.
+  function carryAt(l) { return S.bases[cur].spread * l / 100 * (1 - S.fee); }
+
+  // Headline, side card and formula strip: the fund at its live LTV, on the chosen basis.
+  function renderHead() {
+    var B = S.bases[cur], c = carryAt(S.liveLtv), w = B.label.toLowerCase();
+    set('heroCarry', sg(c) + '%');
+    $('heroCarry').className = 'stat-value hero-value ' + (c > 0 ? 'good' : 'bad');
+    set('heroBasis', w);
+    set('heroUsd', '≈ ' + money(S.px * c / 100) + ' a year per 1 LsETH at today\\'s price.');
+    set('spreadTop', sg(B.spread) + ' pp');
+    set('spreadBasisTop', w);
+    if (S.staking !== null) { set('totalApy', (S.staking + c).toFixed(2) + '%'); set('carryPart', c.toFixed(2)); }
+    set('mathYield', B.yield.toFixed(2) + '%'); set('mathYieldSub', 'vault yield, ' + w);
+    set('mathBorrow', B.borrow.toFixed(2) + '%'); set('mathBorrowSub', 'borrow, ' + w);
+    set('mathDelta', sg(B.spread) + ' pp');
+    set('mathCarry', sg(c) + '%');
+    $('mathCarry').className = 'term ' + (c > 0 ? 'good' : 'bad');
+  }
+
+  // Marks on the LTV track: the health factor manager's band, the target, and today's LTV.
+  var box = $('ltvMarks'), markEls = [];
+  function frac(l) { return Math.max(0, Math.min(1, l / S.lltv)); }
+  function pos(l) { var f = frac(l); return 'calc(' + (f * 100) + '% + ' + ((0.5 - f) * 22) + 'px)'; }
+  var seg = document.createElement('div'); seg.className = 'band-seg';
+  var fa = frac(S.band.lo), fb = frac(S.band.hi);
+  seg.style.left = pos(S.band.lo);
+  seg.style.width = 'calc(' + ((fb - fa) * 100) + '% - ' + ((fb - fa) * 22) + 'px)';
+  seg.innerHTML = '<span>health factor band, ' + S.band.lo.toFixed(1) + '% to ' + S.band.hi.toFixed(1) + '% LTV</span>';
+  if (fb > 0.7) seg.classList.add('end');
+  box.appendChild(seg);
+  var same = Math.abs(S.liveLtv - S.target) < 0.3;
+  var marks = [{ ltv: S.target, label: same ? 'target ' + S.target + '% = live' : 'target ' + S.target + '%', row: 1 }];
+  if (!same) marks.push({ ltv: S.liveLtv, label: 'live ' + S.liveLtv.toFixed(1) + '%', row: 2 });
+  marks.forEach(function (m) {
+    var b = document.createElement('button'); b.type = 'button'; b.textContent = m.label;
+    b.title = 'Set LTV to ' + m.ltv.toFixed(1) + '%';
+    b.style.left = pos(m.ltv);
+    b.style.top = (8 + m.row * 26) + 'px';
+    if (frac(m.ltv) > 0.75) b.classList.add('end');
+    b.addEventListener('click', function () { slider.value = m.ltv; render(); });
+    box.appendChild(b); markEls.push({ el: b, ltv: m.ltv });
+  });
+
+  function render() {
+    var l = parseFloat(slider.value), c = carryAt(l);
+    set('sliderCarry', sg(c) + '%');
+    $('sliderCarry').className = 'big' + (c < 0 ? ' neg' : '');
+    set('sliderLtv', l.toFixed(1) + '%');
+    set('spreadBasis', S.bases[cur].label);
+    set('simHf', l > 0 ? (S.lltv / l).toFixed(3) : 'no debt');
+    set('simBorrow', Math.round(S.px * l / 100).toLocaleString('en-US') + ' USDC');
+    set('simUsd', money(S.px * c / 100) + ' a year');
+    set('simDrop', ((1 - l / S.lltv) * 100).toFixed(1) + '%');
+    $('simWarn').hidden = l <= S.band.hi + 0.05;
+    markEls.forEach(function (m) { m.el.classList.toggle('on', Math.abs(m.ltv - l) < 0.06); });
+  }
+
+  // LTV needed for a given carry: the inverse of carry = spread x LTV x (1 - fee). The tile's
+  // colour is read off the rounded value it shows, so label and colour never disagree.
+  function renderTargets() {
+    var sp = S.bases[cur].spread;
+    [['ltvFor15', 1.5], ['ltvFor20', 2.0], ['ltvFor25', 2.5]].forEach(function (t) {
+      var need = sp > 0 ? t[1] / (sp * (1 - S.fee)) * 100 : Infinity, e = $(t[0]);
+      e.textContent = !isFinite(need) ? 'n/a at a negative spread' : need > S.lltv ? 'needs a wider spread' : need.toFixed(0) + '% LTV';
+      var r = Math.round(need);
+      e.parentElement.className = 'sim-cell ' + (!isFinite(need) || need > S.lltv ? 't-none' : r <= S.target ? 't-good' : r <= S.band.hi ? 't-warn' : 't-bad');
+    });
+  }
+
+  // One basis for the whole page: the headline toggle and the simulator's picker stay in step.
+  var basisBtns = [].slice.call(document.querySelectorAll('[data-basis]'));
+  function setBasis(k) {
+    cur = k;
+    basisBtns.forEach(function (b) {
+      var on = b.getAttribute('data-basis') === k ? 'true' : 'false';
+      b.setAttribute(b.classList.contains('spread-btn') ? 'aria-current' : 'aria-pressed', on);
+    });
+    renderHead(); renderTargets(); render();
+  }
+  basisBtns.forEach(function (b) { b.addEventListener('click', function () { setBasis(b.getAttribute('data-basis')); }); });
+  slider.addEventListener('input', render);
+  setBasis(cur);
+})();
+"""
+
+page = f"""<!doctype html>
 <html lang="en">
+<head>
 <meta charset="utf-8">
-<title>Upshift lsETH Carry — KPK</title>
-<meta property="og:title" content="Upshift lsETH Carry | KPK">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- Reachable by link, not discoverable by search. robots.txt asks crawlers not
+     to fetch; this asks them not to index if they fetch anyway. -->
+<meta name="robots" content="noindex, nofollow">
+<title>LsETH Carry Fund · KPK</title>
+<meta property="og:title" content="LsETH Carry Fund | KPK">
 <meta property="og:type" content="website">
 <meta property="og:site_name" content="KPK">
 <meta property="og:url" content="https://external.kpk.io/upshift-lseth-dashboard/">
@@ -435,1142 +1172,181 @@ html = f"""<!doctype html>
 <meta property="og:image:height" content="630">
 <meta property="og:image:alt" content="KPK">
 <meta name="twitter:card" content="summary_large_image">
-<!-- Reachable by link, not discoverable by search. robots.txt asks crawlers not
-     to fetch; this asks them not to index if they fetch anyway. -->
-<meta name="robots" content="noindex, nofollow">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<style>
-  @font-face {{
-    font-family: 'Lexend';
-    font-weight: 400;
-    src: url(data:font/ttf;base64,{fonts['regular']}) format('truetype');
-    font-display: swap;
-  }}
-  @font-face {{
-    font-family: 'Lexend';
-    font-weight: 500;
-    src: url(data:font/ttf;base64,{fonts['medium']}) format('truetype');
-    font-display: swap;
-  }}
-  @font-face {{
-    font-family: 'Lexend';
-    font-weight: 600;
-    src: url(data:font/ttf;base64,{fonts['semibold']}) format('truetype');
-    font-display: swap;
-  }}
-  @font-face {{
-    font-family: 'Lexend';
-    font-weight: 700;
-    src: url(data:font/ttf;base64,{fonts['bold']}) format('truetype');
-    font-display: swap;
-  }}
-
-  :root {{
-    --bg: #E8E7E5;
-    --surface: #DEDDD8;
-    --surface-2: #F4F3F1;
-    --ink: #1F1F1F;
-    --ink-soft: #706E66;
-    --line: #CAC8C0;
-    --accent-borrow: #206697;
-    --accent-borrow-bg: #E2EFF9;
-    --accent-yield: #22676D;
-    --accent-yield-bg: #E4F5F7;
-    --good: #2D8561;
-    --good-bg: #ECF9F3;
-    --bad: #A5122B;
-    --bad-bg: #FEF3F5;
-    /* Risk ramp for the LTV track. Separate from --good/--bad because those are
-       tuned for text contrast; these are fills that must stay legible as a
-       gradient and read as safe -> caution -> danger in both themes. */
-    --risk-lo: #2D8561;
-    --risk-mid: #8A8F32;
-    --risk-warn: #C0721A;
-    --risk-hi: #A5122B;
-    --chart-borrow: #3F97D6;
-    --chart-yield: #DC5C39;
-    --chart-rwa: #2B848C;
-    --radius: 18px;
-    --font-ui: 'Lexend', 'Montserrat', -apple-system, sans-serif;
-  }}
-
-  @media (prefers-color-scheme: dark) {{
-    :root {{
-      --bg: #1A1916;
-      --surface: #232019;
-      --surface-2: #2B2820;
-      --ink: #F8F8F6;
-      --ink-soft: #ACA89D;
-      --line: #423E33;
-      --accent-borrow: #80BAE4;
-      --accent-borrow-bg: #194F7633;
-      --accent-yield: #4DBEC8;
-      --accent-yield-bg: #17464A55;
-      --good: #56C698;
-      --good-bg: #0F2E2144;
-      --bad: #F6B0BC;
-      --bad-bg: #4908133a;
-      --risk-lo: #56C698;
-      --risk-mid: #B6C45C;
-      --risk-warn: #E8973F;
-      --risk-hi: #E8556F;
-    }}
-  }}
-  :root[data-theme="dark"] {{
-    --bg: #1A1916; --surface: #232019; --surface-2: #2B2820;
-    --ink: #F8F8F6; --ink-soft: #ACA89D; --line: #423E33;
-    --accent-borrow: #80BAE4; --accent-borrow-bg: #194F7633;
-    --accent-yield: #4DBEC8; --accent-yield-bg: #17464A55;
-    --good: #56C698; --good-bg: #0F2E2144;
-    --bad: #F6B0BC; --bad-bg: #4908133a;
-    --risk-lo: #56C698; --risk-mid: #B6C45C; --risk-warn: #E8973F; --risk-hi: #E8556F;
-  }}
-  :root[data-theme="light"] {{
-    --bg: #E8E7E5; --surface: #DEDDD8; --surface-2: #F4F3F1;
-    --ink: #1F1F1F; --ink-soft: #706E66; --line: #CAC8C0;
-    --accent-borrow: #206697; --accent-borrow-bg: #E2EFF9;
-    --accent-yield: #22676D; --accent-yield-bg: #E4F5F7;
-    --good: #2D8561; --good-bg: #ECF9F3;
-    --bad: #A5122B; --bad-bg: #FEF3F5;
-    --risk-lo: #2D8561; --risk-mid: #8A8F32; --risk-warn: #C0721A; --risk-hi: #A5122B;
-  }}
-
-  * {{ box-sizing: border-box; }}
-  html, body {{ margin: 0; padding: 0; }}
-  body {{
-    background: var(--bg);
-    color: var(--ink);
-    font-family: var(--font-ui);
-    font-weight: 400;
-    line-height: 1.45;
-    -webkit-font-smoothing: antialiased;
-    min-height: 100vh;
-  }}
-
-  .page {{
-    max-width: 920px;
-    margin: 0 auto;
-    padding: 26px 24px 64px;
-    display: flex;
-    flex-direction: column;
-    gap: 22px;
-  }}
-
-  header.top {{
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 16px;
-    flex-wrap: wrap;
-  }}
-  .logo {{ width: 92px; color: var(--ink); flex-shrink: 0; }}
-  .logo svg {{ width: 100%; height: auto; display: block; }}
-
-  /* One row rather than three stacked lines: this is provenance, not content,
-     and the vertical space it was taking pushed the simulator below the fold. */
-  .id-block {{
-    display: flex;
-    align-items: baseline;
-    flex-wrap: wrap;
-    gap: 7px;
-    justify-content: flex-end;
-    text-align: right;
-    font-family: var(--font-ui);
-  }}
-  .id-sep {{ color: var(--ink-soft); opacity: 0.5; font-size: 11px; }}
-  .refresh-btn {{
-    display: inline-flex; align-items: center; gap: 4px;
-    padding: 3px 9px; border: 1px solid var(--line); border-radius: 999px;
-    font-size: 11px; font-weight: 500; color: var(--ink-soft);
-    text-decoration: none; white-space: nowrap;
-  }}
-  .refresh-btn:hover {{ color: var(--ink); border-color: var(--ink-soft); }}
-  /* Flag the reading as old rather than letting a stale number look current. The
-     page rebuilds every 4h, so >5h means a run was missed or delayed. */
-  .id-eyebrow.stale {{ color: var(--risk-warn); font-weight: 600; }}
-  .id-eyebrow {{
-    font-size: 12px;
-    font-weight: 500;
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
-    color: var(--ink-soft);
-  }}
-  .id-wallet a {{
-    color: var(--ink);
-    text-decoration: none;
-    font-weight: 500;
-    font-size: 12px;
-    border-bottom: 1px solid var(--line);
-  }}
-  .id-wallet a:hover {{ border-bottom-color: var(--ink-soft); }}
-
-  h1 {{
-    font-size: 26px;
-    font-weight: 600;
-    margin: 0;
-    text-wrap: balance;
-    letter-spacing: -0.01em;
-  }}
-  .subhead {{
-    color: var(--ink-soft);
-    font-size: 15px;
-    margin-top: 4px;
-    max-width: 60ch;
-  }}
-
-  .hero {{
-    display: grid;
-    grid-template-columns: 1.3fr 1fr;
-    gap: 16px;
-  }}
-  @media (max-width: 640px) {{ .hero {{ grid-template-columns: 1fr; }} }}
-
-  .card {{
-    background: var(--surface);
-    border-radius: var(--radius);
-    padding: 24px 26px;
-    border: 1px solid var(--line);
-  }}
-
-  .stat-label {{
-    font-size: 12px;
-    font-weight: 500;
-    letter-spacing: 0.06em;
-    text-transform: uppercase;
-    color: var(--ink-soft);
-    display: flex;
-    align-items: center;
-    gap: 8px;
-  }}
-  .pill {{
-    display: inline-flex;
-    align-items: center;
-    gap: 5px;
-    padding: 3px 10px;
-    border-radius: 100px;
-    font-size: 11px;
-    font-weight: 600;
-    letter-spacing: 0.02em;
-    text-transform: none;
-  }}
-  .pill.good {{ background: var(--good-bg); color: var(--good); }}
-  .pill.bad {{ background: var(--bad-bg); color: var(--bad); }}
-  /* "Live pilot" badge in the h1: signals this is a real position running now,
-     while the subhead carries the small-TVL proof-of-concept framing. */
-  .pill.live-pill {{
-    background: var(--good-bg); color: var(--good);
-    vertical-align: middle; margin-left: 8px;
-  }}
-
-  .stat-value {{
-    font-size: 52px;
-    font-weight: 700;
-    font-variant-numeric: tabular-nums;
-    letter-spacing: -0.02em;
-    margin-top: 10px;
-    line-height: 1;
-  }}
-  .stat-value.good {{ color: var(--good); }}
-  .stat-note {{
-    margin-top: 10px;
-    font-size: 13.5px;
-    color: var(--ink-soft);
-  }}
-
-  .side-stats {{
-    display: flex;
-    flex-direction: column;
-    gap: 12px;
-  }}
-  .mini-stat {{
-    background: var(--surface);
-    border: 1px solid var(--line);
-    border-radius: var(--radius);
-    padding: 16px 20px;
-    display: flex;
-    align-items: baseline;
-    justify-content: space-between;
-    flex: 1;
-  }}
-  .mini-stat .label {{
-    font-size: 13px;
-    font-weight: 500;
-    color: var(--ink-soft);
-  }}
-  .mini-stat .value {{
-    font-size: 22px;
-    font-weight: 600;
-    font-variant-numeric: tabular-nums;
-  }}
-
-  .flow-title {{
-    font-size: 13px;
-    font-weight: 600;
-    letter-spacing: 0.03em;
-    text-transform: uppercase;
-    color: var(--ink-soft);
-    margin: 4px 0 -6px 2px;
-  }}
-
-  .flow {{
-    display: grid;
-    grid-template-columns: 1fr auto 1fr auto 1fr;
-    align-items: center;
-    gap: 12px;
-  }}
-  @media (max-width: 720px) {{
-    .flow {{ grid-template-columns: 1fr; }}
-    .flow .arrow {{ transform: rotate(90deg); justify-self: center; }}
-  }}
-
-  .leg {{
-    background: var(--surface);
-    border: 1px solid var(--line);
-    border-radius: var(--radius);
-    padding: 18px 20px;
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-  }}
-  .leg-kind {{
-    font-size: 11px;
-    font-weight: 600;
-    letter-spacing: 0.05em;
-    text-transform: uppercase;
-    padding: 2px 0;
-  }}
-  .leg.collateral .leg-kind {{ color: var(--ink-soft); }}
-  .leg.borrow .leg-kind {{ color: var(--accent-borrow); }}
-  .leg.yield .leg-kind {{ color: var(--accent-yield); }}
-  .leg-amount {{
-    font-size: 20px;
-    font-weight: 600;
-    font-variant-numeric: tabular-nums;
-  }}
-  .leg-usd {{
-    font-size: 13px;
-    color: var(--ink-soft);
-    font-variant-numeric: tabular-nums;
-  }}
-  .leg-apy {{
-    margin-top: 4px;
-    font-size: 13px;
-    font-weight: 500;
-  }}
-  .leg.borrow .leg-apy {{ color: var(--accent-borrow); }}
-  .leg.yield .leg-apy {{ color: var(--accent-yield); }}
-  .leg a {{ color: inherit; text-decoration: none; border-bottom: 1px dotted currentColor; }}
-
-  .arrow {{
-    color: var(--ink-soft);
-    font-size: 20px;
-    justify-self: center;
-  }}
-
-  .math {{
-    background: var(--surface-2);
-    border: 1px solid var(--line);
-    border-radius: var(--radius);
-    padding: 20px 24px;
-    display: flex;
-    align-items: center;
-    gap: 14px;
-    flex-wrap: wrap;
-    font-size: 15px;
-  }}
-  .math .term {{ font-weight: 600; font-variant-numeric: tabular-nums; }}
-  .math .op {{ color: var(--ink-soft); }}
-  .math .sub {{ font-size: 11.5px; color: var(--ink-soft); display: block; font-weight: 400; margin-top: 1px;}}
-  .math .chunk {{ display: flex; flex-direction: column; align-items: center; }}
-
-  .section-title {{
-    font-size: 13px;
-    font-weight: 600;
-    letter-spacing: 0.03em;
-    text-transform: uppercase;
-    color: var(--ink-soft);
-    margin: 4px 0 -6px 2px;
-  }}
-  .section-note {{
-    font-size: 13.5px;
-    color: var(--ink-soft);
-    margin-top: 2px;
-  }}
-
-  .chart-legend {{
-    display: flex;
-    gap: 20px;
-    margin-bottom: 4px;
-    font-size: 13px;
-    font-weight: 500;
-  }}
-  .chart-legend .key {{
-    display: inline-flex;
-    align-items: center;
-    gap: 7px;
-  }}
-  .chart-legend .swatch {{
-    width: 14px;
-    height: 2px;
-    border-radius: 2px;
-    display: inline-block;
-  }}
-  /* Style-only key: the dashed overlay appears in both line colours, so the
-     swatch shows the pattern rather than claiming a colour. */
-  .chart-legend .swatch-dash {{
-    height: 0; border-top: 1.25px dashed var(--ink-soft); border-radius: 0;
-  }}
-
-  .chart-wrap {{ position: relative; }}
-  .chart-svg {{ width: 100%; height: auto; display: block; overflow: visible; }}
-  .chart-svg text {{ font-family: var(--font-ui); fill: var(--ink-soft); font-size: 11px; }}
-  .chart-grid {{ stroke: var(--line); stroke-width: 1; }}
-  .chart-endlabel {{ font-size: 12px; font-weight: 600; }}
-  .chart-crosshair {{ stroke: var(--ink-soft); stroke-width: 1; }}
-  .chart-annot text {{ font-size: 10.5px; }}
-  .chart-preentry {{ fill: var(--ink); opacity: 0.045; }}
-  .chart-entryline {{ stroke: var(--ink-soft); stroke-width: 1.5; stroke-dasharray: 4 3; }}
-  .chart-entrylabel {{ font-size: 10.5px; font-weight: 500; }}
-
-  /* LTV sensitivity control */
-  .ltv-panel {{ margin-top: 4px; }}
-  /* Sentence case at h2 scale, not the uppercase grey label used elsewhere: this
-     section is interactive and should read as an invitation, not a caption. */
-  .panel-title {{
-    font-size: 19px; font-weight: 600; color: var(--ink);
-    letter-spacing: -0.01em; margin: 0;
-  }}
-  .ltv-head {{
-    display: flex; align-items: baseline; justify-content: space-between;
-    gap: 12px; flex-wrap: wrap; margin-bottom: 14px;
-  }}
-  .ltv-readout {{ display: flex; align-items: baseline; gap: 10px; }}
-  .ltv-readout .big {{
-    font-size: 34px; font-weight: 600; letter-spacing: -0.02em;
-    font-variant-numeric: tabular-nums; color: var(--good);
-  }}
-  .ltv-readout .unit {{ font-size: 13px; color: var(--ink-soft); }}
-  .ltv-current {{ font-size: 12.5px; color: var(--ink-soft); }}
-  .ltv-current b {{ color: var(--ink); font-weight: 600; font-variant-numeric: tabular-nums; }}
-  .slider-row {{ display: flex; align-items: flex-start; gap: 14px; }}
-  /* The scale must share the track's exact box, not the row's: the row also
-     holds the readout, so measuring tick percentages against row width drifts
-     them right of the values they label. */
-  .slider-track {{ flex: 1; min-width: 0; }}
-  .slider-row input[type=range] {{
-    display: block; width: 100%; margin: 0;
-    -webkit-appearance: none; appearance: none;
-    height: 6px; border-radius: 4px; outline: none;
-    /* Stops are anchored to real LTV thresholds (set from Python, since they
-       depend on the market's LLTV) rather than spread evenly, so the red is
-       concentrated near liquidation where the risk actually is. */
-    background: linear-gradient(to right,
-      var(--risk-lo) 0%,
-      var(--risk-lo) {grad_safe_pct:.1f}%,
-      var(--risk-mid) {grad_mid_pct:.1f}%,
-      var(--risk-warn) {grad_warn_pct:.1f}%,
-      var(--risk-hi) 100%);
-  }}
-  /* --thumb-color is set from JS to the risk tier at the current LTV, so the
-     handle itself carries the same safe/caution/danger signal as the track. */
-  .slider-row input[type=range] {{ --thumb-color: var(--risk-lo); }}
-  .slider-row input[type=range]::-webkit-slider-thumb {{
-    -webkit-appearance: none; appearance: none;
-    width: 20px; height: 20px; border-radius: 50%;
-    background: var(--thumb-color); border: 3px solid var(--surface);
-    box-shadow: 0 1px 4px rgba(0,0,0,0.3); cursor: pointer;
-  }}
-  .slider-row input[type=range]::-moz-range-thumb {{
-    width: 20px; height: 20px; border-radius: 50%;
-    background: var(--thumb-color); border: 3px solid var(--surface);
-    box-shadow: 0 1px 4px rgba(0,0,0,0.3); cursor: pointer;
-  }}
-  .slider-val {{
-    font-size: 15px; font-weight: 600; font-variant-numeric: tabular-nums;
-    min-width: 58px; text-align: right;
-    /* Drop past the endpoint labels above the rail so the readout sits level
-       with the rail itself, not with "liquidation 86%". */
-    margin-top: 12px;
-  }}
-  .ltv-scale {{
-    position: relative; height: 34px; margin-top: 6px;
-    font-size: 10px; color: var(--ink-soft);
-  }}
-  /* Below this the four markers cannot fit side by side at any sensible font
-     size, so the two contextual ones drop out and the anchors that matter --
-     live and liquidation -- keep their positions. */
-  @media (max-width: 560px) {{
-    .ltv-scale .mark.is-optional {{ display: none; }}
-  }}
-  /* Inset by the thumb radius: a range thumb's centre travels from 10px to
-     (width - 10px), never the full 0-100%, so ticks placed on raw percentages
-     sit wrong at both ends. `left` is set as a calc() in JS against this. */
-  .ltv-scale {{ --thumb-r: 10px; }}
-  /* Marks are buttons, not labels: clicking one snaps the slider to that LTV,
-     which is the fastest way to compare live vs target without dragging. */
-  .ltv-scale .mark {{
-    position: absolute; transform: translateX(-50%);
-    text-align: center; white-space: nowrap;
-    background: none; border: 0; padding: 3px 4px 0;
-    font: inherit; color: var(--ink-soft); cursor: pointer;
-    border-radius: 5px;
-  }}
-  .ltv-scale .mark:hover {{ color: var(--ink); background: var(--surface); z-index: 2; }}
-  .ltv-scale .mark[aria-current="true"] {{ color: var(--ink); font-weight: 600; }}
-  /* The operating target is the number readers should anchor on, so it stays
-     emphasised even when the slider is parked elsewhere. */
-  .ltv-scale .mark.is-target {{ color: var(--ink); font-weight: 600; }}
-  .ltv-scale .mark.is-target::before {{ border-color: var(--ink); }}
-  /* Track endpoints render ABOVE the rail (they precede the input in the DOM),
-     keeping them clear of the clickable markers below it -- the 75% target lands
-     at ~87% of an 86% scale, exactly where a right-aligned end label would sit. */
-  .track-ends {{
-    display: flex; justify-content: space-between;
-    font-size: 10px; color: var(--ink-soft); margin-bottom: 5px;
-  }}
-  .track-ends .liq-end {{ color: var(--risk-hi); font-weight: 500; }}
-  .ltv-scale .mark::before {{
-    content: ''; display: block; width: 7px; height: 7px; border-radius: 50%;
-    border: 1.5px solid var(--ink-soft); background: var(--surface);
-    margin: 0 auto 4px; box-sizing: border-box;
-  }}
-  .ltv-scale .mark:hover::before {{ border-color: var(--ink); }}
-  .ltv-scale .mark[aria-current="true"]::before {{ background: var(--ink); border-color: var(--ink); }}
-  /* End labels are pulled inward so they don't overflow the card, but the tick
-     must keep pointing at the real value -- so it's positioned against the
-     label's own edge rather than its centre. */
-  .ltv-scale .mark.at-end::before {{ margin-right: 0; }}
-  .ltv-scale .mark.at-start::before {{ margin-left: 0; }}
-  .target-row {{
-    display: flex; gap: 10px; flex-wrap: wrap; margin-top: 16px;
-    padding-top: 14px; border-top: 1px solid var(--line);
-  }}
-  .target {{
-    flex: 1; min-width: 150px; padding: 10px 12px;
-    border: 1px solid var(--line); border-radius: 10px; background: var(--surface-2);
-  }}
-  .target .t-label {{ font-size: 11px; color: var(--ink-soft); text-transform: uppercase; letter-spacing: 0.04em; }}
-  .target .t-val {{ font-size: 15px; font-weight: 600; margin-top: 3px; font-variant-numeric: tabular-nums; }}
-  /* Tiles carry the SAME risk tier as the slider track at that LTV, so a value
-     reads consistently wherever it appears: green inside the operating band,
-     amber approaching the target, red near liquidation, muted when unreachable. */
-  .target.risk-lo {{ border-color: var(--risk-lo); background: var(--good-bg); }}
-  .target.risk-lo .t-val {{ color: var(--risk-lo); }}
-  .target.risk-mid {{ border-color: var(--risk-mid); }}
-  .target.risk-mid .t-val {{ color: var(--risk-mid); }}
-  .target.risk-warn {{ border-color: var(--risk-warn); }}
-  .target.risk-warn .t-val {{ color: var(--risk-warn); }}
-  .target.risk-hi {{ border-color: var(--risk-hi); background: var(--bad-bg); }}
-  .target.risk-hi .t-val {{ color: var(--risk-hi); }}
-  .target.unreachable .t-val {{ color: var(--ink-soft); }}
-  .per-unit-note {{ font-size: 12px; color: var(--ink-soft); margin-top: 10px; }}
-  .per-unit-note a {{ color: var(--accent-borrow); text-decoration: none; border-bottom: 1px dotted currentColor; }}
-
-  /* The conservative-LTV framing is load-bearing for how every number on this
-     page should be read, so it gets its own block rather than a footnote. */
-  .callout {{
-    display: flex; gap: 12px; align-items: flex-start;
-    padding: 14px 16px; border-radius: 12px;
-    background: var(--accent-borrow-bg);
-    border: 1px solid var(--accent-borrow);
-  }}
-  .callout-mark {{
-    flex: none; width: 20px; height: 20px; border-radius: 50%;
-    background: var(--accent-borrow); color: var(--surface);
-    font-size: 13px; font-weight: 700; line-height: 20px; text-align: center;
-    margin-top: 1px;
-  }}
-  .callout-title {{ font-size: 14px; font-weight: 600; color: var(--ink); }}
-  .callout-body {{ font-size: 12.5px; color: var(--ink-soft); margin-top: 4px; line-height: 1.5; }}
-  .callout-body b {{ color: var(--ink); font-weight: 600; }}
-
-  /* Supporting evidence between the simulator and the chart: its own quiet block
-     rather than a footnote inside the simulator card, which made that card long
-     enough to push the interactive controls off-screen. */
-  .spread-strip {{
-    display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap;
-    padding: 11px 14px; border: 1px solid var(--line); border-radius: 10px;
-    background: var(--surface-2); font-size: 12px; color: var(--ink-soft);
-  }}
-  .spread-strip .strip-label {{
-    font-weight: 600; color: var(--ink); font-size: 12px; flex: none;
-  }}
-  .spread-strip .strip-body {{ flex: 1 1 340px; line-height: 1.55; }}
-  .spread-strip b {{ color: var(--good); font-weight: 600; }}
-  .spread-strip a {{
-    color: var(--accent-borrow); text-decoration: none;
-    border-bottom: 1px dotted currentColor; white-space: nowrap;
-  }}
-
-  .mini-stat .sublabel {{
-    display: block; font-style: normal; font-size: 10.5px;
-    color: var(--ink-soft); opacity: 0.85; margin-top: 2px;
-  }}
-
-  /* Spread is the simulation's second input, so the horizon comparison lives
-     here as a control rather than as a separate read-only strip. */
-  .spread-picker {{
-    display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
-    margin-bottom: 18px;
-  }}
-  .spread-picker .picker-label {{
-    font-size: 12px; color: var(--ink-soft); margin-right: 2px;
-  }}
-  .spread-btn {{
-    display: flex; flex-direction: column; align-items: flex-start; gap: 1px;
-    padding: 6px 11px; border: 1px solid var(--line); border-radius: 9px;
-    background: var(--surface-2); color: var(--ink-soft);
-    font: inherit; cursor: pointer; text-align: left;
-  }}
-  .spread-btn i {{ font-style: normal; font-size: 10.5px; letter-spacing: 0.03em; }}
-  .spread-btn b {{ font-size: 13px; font-weight: 600; font-variant-numeric: tabular-nums; }}
-  .spread-btn:hover {{ border-color: var(--ink-soft); color: var(--ink); }}
-  .spread-btn[aria-current="true"] {{
-    border-color: var(--good); background: var(--good-bg); color: var(--ink);
-  }}
-  .spread-btn[aria-current="true"] b {{ color: var(--good); }}
-  .spread-picker .picker-note {{
-    flex: 1 1 100%; font-size: 11.5px; color: var(--ink-soft); margin-top: 2px;
-  }}
-
-  .chart-tooltip {{
-    position: absolute;
-    pointer-events: none;
-    background: var(--surface-2);
-    border: 1px solid var(--line);
-    border-radius: 10px;
-    padding: 8px 12px;
-    font-size: 12.5px;
-    box-shadow: 0 4px 14px rgba(0,0,0,0.12);
-    visibility: hidden;
-    transform: translate(-50%, calc(-100% - 12px));
-    white-space: nowrap;
-    z-index: 5;
-  }}
-  .chart-tooltip .date {{ color: var(--ink-soft); font-size: 11px; margin-bottom: 3px; }}
-  .chart-tooltip .row {{ display: flex; align-items: center; gap: 6px; }}
-  .chart-tooltip .key {{ width: 10px; height: 2px; border-radius: 2px; display: inline-block; }}
-  .chart-tooltip .val {{ font-weight: 600; font-variant-numeric: tabular-nums; margin-left: auto; padding-left: 10px; }}
-
-  details.chart-table {{ font-size: 13px; }}
-  details.chart-table summary {{
-    cursor: pointer;
-    color: var(--ink-soft);
-    font-weight: 500;
-    font-size: 13px;
-  }}
-  .table-scroll {{ overflow-x: auto; margin-top: 10px; }}
-  table.data {{
-    border-collapse: collapse;
-    width: 100%;
-    font-size: 12.5px;
-  }}
-  table.data th, table.data td {{
-    text-align: right;
-    padding: 5px 10px;
-    font-variant-numeric: tabular-nums;
-    border-bottom: 1px solid var(--line);
-  }}
-  table.data th:first-child, table.data td:first-child {{ text-align: left; font-variant-numeric: normal; }}
-  table.data th {{ color: var(--ink-soft); font-weight: 500; }}
-
-  footer {{
-    display: flex;
-    justify-content: space-between;
-    align-items: baseline;
-    flex-wrap: wrap;
-    gap: 8px;
-    font-size: 12.5px;
-    color: var(--ink-soft);
-    border-top: 1px solid var(--line);
-    padding-top: 16px;
-  }}
-  footer a {{ color: var(--ink-soft); text-decoration: underline; }}
-
-  a:focus-visible, button:focus-visible {{
-    outline: 2px solid var(--accent-borrow);
-    outline-offset: 2px;
-  }}
-
-  @media (prefers-reduced-motion: no-preference) {{
-    .card, .leg, .mini-stat {{ transition: border-color 0.15s ease; }}
-  }}
-</style>
-
+<meta name="description" content="KPK's LsETH Carry Fund: LsETH collateral on Morpho, USDC borrowed and deployed in KPK's USDC vaults. Live carry, position, risk controls and terms.">
+<style>{fonts_css}{tokens_css}{CSS}</style>
+</head>
+<body>
 <div class="page">
 
-  <header class="top">
-    <div class="logo">{logo_svg}</div>
-    <div class="id-block">
-      <span class="id-eyebrow">Ethereum · Upshift trader subaccount</span>
-      <span class="id-sep" aria-hidden="true">·</span>
-      <span class="id-wallet"><a href="{debank_url}" target="_blank" rel="noopener">{wallet[:6]}…{wallet[-4:]}</a></span>
-      <span class="id-sep" aria-hidden="true">·</span>
-      <span class="id-eyebrow" id="asOf" data-built="{built_epoch}">{as_of}</span>
-      <a class="refresh-btn" href="{actions_url}" target="_blank" rel="noopener"
-         title="Rebuilds from live data. Opens the GitHub Actions run page — click 'Run workflow' there, then reload this page in ~1 min.">
-        <span aria-hidden="true">&#8635;</span> Refresh
-      </a>
-    </div>
-  </header>
+<header class="top">
+  <div class="logo" aria-label="KPK">{logo_svg}</div>
+  <div class="meta">
+    <span>Ethereum mainnet</span><span aria-hidden="true">·</span>
+    <span class="asof" id="asOf" data-built="{built_epoch}">As of {as_of}</span>
+    <button type="button" class="theme-btn" id="themeBtn" title="Switch theme">Auto</button>
+  </div>
+</header>
 
-  <div>
-    <h1>lsETH carry position <span class="pill live-pill">● live pilot</span></h1>
-    <div class="subhead">
-      Borrow USDC against lsETH on Morpho, redeploy it across KPK's USDC Morpho
-      vaults, and keep the spread — extra yield on lsETH you were holding anyway.
-      Live since 4 Aug 2026 as a small proof-of-concept position, now running at
-      the <b>{ltv:.0f}% production LTV target</b> after a staged ramp.
+<section class="hero" id="overview">
+  <h1>LsETH Carry Fund <span class="pill">live since {esc(CONFIG['live_since'])}</span></h1>
+  {''.join(f'<p>{T(p)}</p>' for p in CONFIG['intro'])}
+  <div class="row">
+    <a class="cta" href="{esc(CONFIG['app_url'])}" target="_blank" rel="noopener">View the fund in the KPK app ↗</a>
+    <a class="cta ghost" href="{esc(DOCS['fund'])}" target="_blank" rel="noopener">Read the fund docs ↗</a>
+    <span class="asof-note">Deposit asset:</span> {deposit_chips}
+    <span class="asof-note">{ext(DOCS['dune'], 'Live metrics on Dune ↗')}</span>
+  </div>
+  <div class="scope" aria-label="Scope">{scope_cards()}</div>
+</section>
+
+<section id="numbers">
+  <span class="label">Headline numbers</span>
+  <h2>What the fund earns on LsETH</h2>
+  <div class="headline">
+    <div class="card hero-main">
+      <div class="stat-label">Carry on LsETH {basis_toggle}</div>
+      <div class="stat-value hero-value {'good' if carry_head > 0 else 'bad'}" id="heroCarry">{sgn(carry_head)}%</div>
+      <div class="stat-note">a year on the LsETH held, on top of its staking yield, at today's <b>{ltv:.1f}%</b> LTV and the <b id="heroBasis">{esc(basis_word(B0['label']))}</b> spread, after the {PERF_FEE * 100:.0f}% performance fee. <em>Not a promise: rates move.</em></div>
+      <div class="stat-sub" id="heroUsd">≈ {money(lseth_price * carry_head / 100)} a year per 1 LsETH at today's price.</div>
+    </div>
+    <div class="side-stats">{hero_side}</div>
+  </div>
+  {math_strip}
+  {status_note}
+  {backtest_fold}
+</section>
+
+<section id="structure">
+  <span class="label">Position structure</span>
+  <h2>How the position is built</h2>
+  <div class="flow">
+    <div class="card leg">
+      <div class="leg-head"><span class="leg-kind">Collateral</span>{icon("lseth")}</div>
+      <div class="leg-amount">{coll['amount']:,.4f} LsETH</div>
+      <div class="kv"><span>value</span><span class="mono">≈ {money(coll['usd'])}</span></div>
+      <div class="kv"><span>venue</span><span>{ext(market_url, 'Morpho LsETH/USDC ↗')}</span></div>
+      <div class="kv"><span>LLTV</span><span class="mono">{lltv:.1f}%</span></div>
+    </div>
+    <div class="arrow" aria-hidden="true">→</div>
+    <div class="card leg">
+      <div class="leg-head"><span class="leg-kind">Borrow · Morpho LsETH/USDC</span>{icon("morpho")}</div>
+      <div class="leg-amount">{borrow['amount']:,.0f} USDC</div>
+      <div class="kv"><span>LTV today</span><span class="mono">{ltv:.1f}%</span></div>
+      <div class="kv"><span>per 1 LsETH</span><span class="mono">{per_unit_borrow:,.0f} USDC</span></div>
+      <div class="kv"><span><b>borrow rate, live</b></span><span class="mono"><b>{borrow['apy_pct']:.2f}%</b></span></div>
+    </div>
+    <div class="arrow" aria-hidden="true">→</div>
+    <div class="card leg">
+      <div class="leg-head"><span class="leg-kind">Liquid sleeve · Morpho</span>{icon("morpho")}</div>
+      <div class="leg-amount">{dep['amount']:,.0f} USDC</div>
+      {vault_rows}
+      <div class="kv"><span><b>blended, live</b></span><span class="mono"><b>{dep['apy_pct']:.2f}%</b></span></div>
     </div>
   </div>
-
-  <div class="hero">
-    <div class="card">
-      <div class="stat-label">Carry on top of lsETH <span class="pill good" id="carryPill">↑ carry positive</span></div>
-      <div class="stat-value good" id="heroCarry">+{net_lseth_after_fee:.2f}%</div>
-      <div class="stat-note">
-        What 1 lsETH earns <b>in addition to</b> its own staking yield, by borrowing
-        USDC against it at <b id="heroLtv">{ltv:.0f}%</b> LTV and lending that USDC
-        out — net of the 10% performance fee.
+  <div class="stat-sub">{esc(position_age_note)} KPK curates both sides of the LsETH/USDC market, and holds the borrow rate competitive with comparable 86%-LLTV USDC markets such as wstETH/USDC and rETH/USDC. LsETH is marked at {money(lseth_price)} by the market's oracle; vault yields are net of the vaults' fees. Verify the collateral and borrow legs on {ext(debank_url, 'DeBank ↗')}, which shows both positions but not the underlying yield.</div>
+  {share_card}
+  <div class="card">
+    <div class="stat-label">Borrow rate and vault yields since the position opened</div>
+    {legend}
+    <div class="chart">
+      {chart['svg']}
+      <div id="chartTooltip" class="chart-tooltip" role="status">
+        <div class="date" id="ttDate"></div>
+        <div class="row"><span class="key" style="background:var(--c-yield)"></span>Yield<span class="val" id="ttYield"></span></div>
+        <div class="row"><span class="key" style="background:var(--c-rwa)"></span>Yield RWA<span class="val" id="ttRwa"></span></div>
+        <div class="row"><span class="key" style="background:var(--c-borrow)"></span>Borrow<span class="val" id="ttBorrow"></span></div>
+        <div class="row"><span style="width:10px"></span>Spread<span class="val" id="ttDelta"></span></div>
       </div>
     </div>
-    <div class="side-stats">
-      <div class="mini-stat">
-        <span class="label">
-          Spread: lend rate − borrow rate
-          <em class="sublabel" id="spreadBasisTop">{default_basis_sub}</em>
-        </span>
-        <span class="value" style="color:var(--good)" id="spreadTop">+{default_spread:.2f} pp</span>
-      </div>
-      {total_apy_card}
-    </div>
+    <div class="stat-sub">Daily borrow rate on the LsETH/USDC market against the net lend rate of both KPK USDC vaults; the fund has lent into KPK USDC Yield RWA since 27 Aug. The dashed line is KPK USDC Yield's 30-day trend.</div>
   </div>
-
-  <div>
-    <div class="flow-title">How the trade works, per 1 lsETH</div>
-    <div class="flow">
-      <div class="leg collateral">
-        <div class="leg-kind">Collateral</div>
-        <div class="leg-amount">1.000 lsETH</div>
-        <div class="leg-usd">${lseth_price:,.0f}</div>
+  <div class="card">
+    <details class="fold">
+      <summary>Daily data table</summary>
+      <div class="table-scroll">
+        <table class="data">
+          <thead><tr><th>Date</th><th class="num">Borrow APY</th><th class="num">Yield APY</th><th class="num">RWA APY</th><th class="num">Spread (Yield - Borrow)</th></tr></thead>
+          <tbody>
+          {chart['table_rows']}
+          </tbody>
+        </table>
       </div>
-      <div class="arrow">→</div>
-      <div class="leg borrow">
-        <div class="leg-kind">Borrow · <a href="{market_url}" target="_blank" rel="noopener">lsETH/USDC market ↗</a></div>
-        <div class="leg-amount"><span id="perUnitBorrow">{per_unit_borrow:,.0f}</span> USDC</div>
-        <div class="leg-usd">at <span id="perUnitLtv">{ltv:.0f}</span>% LTV</div>
-        <div class="leg-apy">−{borrow['apy_pct']:.2f}% paid (spot rate)</div>
-      </div>
-      <div class="arrow">→</div>
-      <div class="leg yield">
-        <div class="leg-kind">Deposit ·
-          <a href="{vault_url}" target="_blank" rel="noopener">USDC Yield ↗</a> +
-          <a href="{rwa_url}" target="_blank" rel="noopener">Yield RWA ↗</a></div>
-        <div class="leg-amount"><span id="perUnitDeposit">{per_unit_borrow:,.0f}</span> USDC</div>
-        <div class="leg-usd">split ~{yield_w:.0f}/{rwa_w:.0f} across the two vaults</div>
-        <div class="leg-apy">+{dep['apy_pct']:.2f}% earned (blended spot, net of fees)</div>
-      </div>
-    </div>
-    <div class="per-unit-note">
-      KPK curates both sides of this market, and holds the borrow rate competitive
-      with comparable 86%-LLTV USDC markets such as wstETH/USDC and rETH/USDC.
-      The working below follows whichever spread you pick in the simulator.
-      Scales linearly: 1 lsETH or 10,000 lsETH earns the same percentage.
-      lsETH marked at ${lseth_price:,.0f} by the market's oracle.
-    </div>
+    </details>
   </div>
+</section>
 
-  <div class="math">
-    <div class="chunk"><span class="term" style="color:var(--accent-yield)" id="mathYield">{default_legs['yield_pct']:.2f}%</span><span class="sub" id="mathYieldSub">{default_yield_sub}</span></div>
-    <span class="op">−</span>
-    <div class="chunk"><span class="term" style="color:var(--accent-borrow)" id="mathBorrow">{default_legs['borrow_pct']:.2f}%</span><span class="sub" id="mathBorrowSub">{default_borrow_sub}</span></div>
-    <span class="op">=</span>
-    <div class="chunk"><span class="term" id="mathDelta">{default_spread:.2f} pp</span><span class="sub">Delta APY</span></div>
-    <span class="op">×</span>
-    <div class="chunk"><span class="term" id="mathLtv">{ltv:.0f}%</span><span class="sub">LTV</span></div>
-    <span class="op">×</span>
-    <div class="chunk"><span class="term">0.9</span><span class="sub">After 10% fee</span></div>
-    <span class="op">=</span>
-    <div class="chunk"><span class="term" style="color:var(--good)" id="mathCarry">+{net_lseth_after_fee:.2f}%</span><span class="sub">Carry on lsETH</span></div>
-  </div>
-
-  <div class="card ltv-panel">
-    <div class="ltv-head">
-      <div>
-        <div class="panel-title">Simulate carry at your LTV</div>
-        <div class="section-note" style="margin-top:4px">
-          Pick a spread, then drag the handle or click a marker below.
-        </div>
-      </div>
-      <div class="ltv-readout">
-        <span class="big" id="sliderCarry">+{net_lseth_after_fee:.2f}%</span>
-        <span class="unit">on lsETH, after fee<br>at <span id="spreadBasis">{default_basis_label}</span> spread</span>
-      </div>
+<section id="simulator">
+  <span class="label">Carry simulator</span>
+  <div class="card">
+    <div class="sim-head">
+      <div><h2>Carry per 1 LsETH at a chosen LTV</h2>
+      <p class="lede">Carry = spread × LTV × {fee_term}. The position is managed by health factor, which sets LTV ({V['lltv']} LLTV ÷ health factor); the shaded segment is the health factor manager's band. Scales linearly: 1 LsETH or 10,000 LsETH earns the same percentage. Pick a spread, then drag the handle or click a marker.</p></div>
+      <div class="sim-out"><span class="big" id="sliderCarry">{sgn(carry_head)}%</span><span class="muted">a year on LsETH<br>at <b id="sliderLtv">{ltv:.1f}%</b> LTV, <span id="spreadBasis">{esc(B0['label'])}</span> spread, after fee</span></div>
     </div>
-
     <div class="spread-picker" role="group" aria-label="Which spread to simulate with">
       <span class="picker-label">Spread</span>
       {spread_buttons}
-      <span class="picker-note">
-        <b>Live</b> is the forward-looking basis. The trailing options are a reality
-        check on it, each pairing the vault's realized net APY with the borrow rate
-        over the same window.
-      </span>
+      <span class="picker-note"><b>Live</b> is the forward-looking basis. The trailing options are a reality check on it, each pairing the vaults' realised net APY with the borrow rate over the same window. The headline above follows the same choice.</span>
     </div>
-
-    <div class="slider-row">
-      <div class="slider-track">
-        <div class="track-ends" aria-hidden="true">
-          <span>0%</span>
-          <span class="liq-end">liquidation {lltv:.0f}%</span>
-        </div>
-        <input type="range" id="ltvSlider" min="0" max="{lltv:.0f}" step="1" value="{ltv:.0f}"
-               aria-label="Borrow loan-to-value, percent">
-        <div class="ltv-scale" id="ltvScale"></div>
-      </div>
-      <span class="slider-val" id="sliderLtv">{ltv:.0f}%</span>
+    <div class="slider-wrap">
+      <div class="ends"><span>0% LTV, no carry</span><span class="hi">liquidation at {lltv:.0f}% LTV</span></div>
+      <input type="range" id="ltvSlider" min="0" max="{lltv:g}" step="0.1" value="{ltv:.1f}" aria-label="Loan-to-value, percent" style="{slider_bg}">
+      <div class="marks" id="ltvMarks"></div>
     </div>
+    <div class="note" id="simWarn" hidden>Above {V['repay_below_ltv']} LTV, a health factor below {V['repay_below']}, the health factor manager repays back to {V['repay_to_ltv']}.</div>
+    <div class="sim-grid">
+      <div class="sim-cell"><div class="k">Health factor</div><div class="v" id="simHf"></div></div>
+      <div class="sim-cell"><div class="k">Borrowed per 1 LsETH</div><div class="v" id="simBorrow"></div></div>
+      <div class="sim-cell"><div class="k">Carry per 1 LsETH</div><div class="v" id="simUsd"></div></div>
+      <div class="sim-cell"><div class="k">LsETH drop to liquidation</div><div class="v" id="simDrop"></div></div>
+    </div>
+    <div class="sim-grid three">
+      <div class="sim-cell"><div class="k">LTV needed for +1.5% a year</div><div class="v" id="ltvFor15"></div></div>
+      <div class="sim-cell"><div class="k">LTV needed for +2.0% a year</div><div class="v" id="ltvFor20"></div></div>
+      <div class="sim-cell"><div class="k">LTV needed for +2.5% a year</div><div class="v" id="ltvFor25"></div></div>
+    </div>
+    <div class="stat-sub" style="margin-top:12px">At live rates, LsETH at {money(lseth_price)}. The spread is held fixed: borrowing more pushes the market's USDC borrow rate up, so the high-LTV end reads high.</div>
+  </div>
+</section>
 
-    <div class="target-row" id="targetRow">
-      <div class="target">
-        <div class="t-label">LTV needed for +1.5% APY</div>
-        <div class="t-val" id="ltvFor15">—</div>
-      </div>
-      <div class="target">
-        <div class="t-label">LTV needed for +2.0% APY</div>
-        <div class="t-val" id="ltvFor20">—</div>
-      </div>
-      <div class="target">
-        <div class="t-label">LTV needed for +2.5% APY</div>
-        <div class="t-val" id="ltvFor25">—</div>
-      </div>
+{risk_section()}
+<section id="terms">
+  <span class="label">Risks and terms</span>
+  <h2>{esc(MAIN_RISKS['title'])}</h2>
+  <div class="card">
+    <div class="risk-list">{risk_rows}</div>
+  </div>
+  <div class="sub-h">Subscriptions, redemptions and fees</div>
+  <div class="grid g2">
+    <div class="card">
+      <div class="stat-label">Subscriptions and redemptions</div>
+      <div class="redeem">{terms_tiles}</div>
+      <div class="stat-sub" style="margin-top:10px">{esc(TERMS['note'])}</div>
+    </div>
+    <div class="card">
+      <div class="stat-label">Fees and limits</div>
+      {terms_rows}
     </div>
   </div>
+</section>
 
-  <div class="callout">
-    <div class="callout-mark" aria-hidden="true">!</div>
-    <div>
-      <div class="callout-title">
-        Running at the {ltv:.0f}% production LTV target since 27 Aug
-      </div>
-      <div class="callout-body">
-        The ramp is complete: ~45% at launch, ~65% from 10 Aug, and the <b>~75%
-        production target</b> since 27 Aug — each step gated on the rebalancing and
-        liquidation-protection agents banking live track record at the previous
-        level. The position is held at this level automatically: the agents
-        re-lever on strength and de-risk on weakness around it. The borrowed USDC
-        is split across <b>two</b> KPK vaults (USDC Yield + USDC Yield RWA,
-        ~{yield_w:.0f}/{rwa_w:.0f}), so the deposit APY shown is the blend of where
-        the money actually sits. Position size is a deliberately small pilot: the
-        carry is a percentage, so it is the same at this size or at scale.
-      </div>
-    </div>
-  </div>
-
-  <div class="spread-strip">
-    <span class="strip-label">Backtest cross-check</span>
-    <span class="strip-body">
-      Over the 180 days to 30 Jul 2026, on reconstructed on-chain borrow rates and
-      the vault's realized share price, this strategy at 75% LTV averaged
-      <b>+2.11%</b> net over lsETH — monthly range 1.32% to 3.17%, with the 1.5%
-      floor cleared on 75% of days. That run used deeper 86%-LLTV proxy markets,
-      because lsETH/USDC had no rate history at the time; its own 45 days since
-      have averaged 4.01% borrow at 89% utilization, against the proxy's 4.01%.
-      <a href="{backtest_url}" target="_blank" rel="noopener">Query ↗</a>
-    </span>
-  </div>
-
-
-
-  <div>
-    <div class="section-title">Full history</div>
-    <div class="section-note">
-      Daily borrow rate (lsETH/USDC market) vs. net lend rate on both deploy
-      vaults — KPK USDC Yield, and KPK USDC Yield RWA in teal, which joined the
-      position on 27 Aug at a target 60/40 split —
-      since the market went live on {since_date}. {entry_sentence}
-      Solid lines are the daily rates — the variation is real and drives realized
-      performance. The dashed line is the vault's 30-day trend: its lend rate is
-      share-price-derived, so a single day's step annualises into a spike, and the
-      trend is the like-for-like view against the backtest. The borrow rate needs
-      no trend line; it has held between 3.8% and 4.1% throughout.
-    </div>
-  </div>
-
-  <div class="card chart-wrap">
-    <div class="chart-legend">
-      <span class="key"><span class="swatch" style="background:var(--chart-borrow)"></span>Borrow APY · lsETH/USDC</span>
-      <span class="key"><span class="swatch" style="background:var(--chart-yield)"></span>Yield APY · KPK USDC Yield</span>
-      <span class="key"><span class="swatch" style="background:var(--chart-rwa)"></span>Yield APY · KPK USDC Yield RWA</span>
-      <span class="key"><span class="swatch swatch-dash"></span>Yield · 30-day trend</span>
-    </div>
-    {chart['svg']}
-    <div id="chartTooltip" class="chart-tooltip">
-      <div class="date" id="ttDate"></div>
-      <div class="row"><span class="key" style="background:var(--chart-yield)"></span>Yield<span class="val" id="ttYield"></span></div>
-      <div class="row"><span class="key" style="background:var(--chart-rwa)"></span>Yield RWA<span class="val" id="ttRwa"></span></div>
-      <div class="row"><span class="key" style="background:var(--chart-borrow)"></span>Borrow<span class="val" id="ttBorrow"></span></div>
-      <div class="row"><span style="width:10px"></span>Delta<span class="val" id="ttDelta"></span></div>
-    </div>
-  </div>
-
-  <details class="chart-table">
-    <summary>Show actual live position — {coll['amount']:.2f} lsETH pilot</summary>
-    <div class="table-scroll">
-      <table class="data">
-        <thead><tr><th>Leg</th><th>Amount</th><th>USD</th><th>APY</th></tr></thead>
-        <tbody>
-          <tr><td>Collateral · lsETH</td><td>{coll['amount']:.4f}</td><td>${coll['usd']:,.0f}</td><td>—</td></tr>
-          <tr><td>Borrow · USDC</td><td>{borrow['amount']:,.2f}</td><td>${borrow['usd']:,.0f}</td><td>{borrow['apy_pct']:.2f}%</td></tr>
-          {deposit_rows}
-          <tr><td>Deposit · combined</td><td>{dep['amount']:,.2f}</td><td>${dep['usd']:,.0f}</td><td>{dep['apy_pct']:.2f}% blended</td></tr>
-          <tr><td>Live LTV</td><td>{ltv:.2f}%</td><td>—</td><td>—</td></tr>
-          <tr><td>Carry at live LTV, gross</td><td>—</td><td>—</td><td>+{net_lseth:.2f}%</td></tr>
-          <tr><td>Carry at live LTV, net of 10% fee</td><td>—</td><td>—</td><td>+{net_lseth_after_fee:.2f}%</td></tr>
-        </tbody>
-      </table>
-    </div>
-    <div class="per-unit-note">
-      {position_age_note} Sizing is a deliberately small pilot: the carry is a
-      percentage, so the return is the same at this size or at scale.
-      Verify the collateral and borrow legs on
-      <a href="{debank_url}" target="_blank" rel="noopener">DeBank ↗</a>
-      — it shows both positions, but not the underlying yield.
-    </div>
-  </details>
-
-  <details class="chart-table">
-    <summary>Show daily data table</summary>
-    <div class="table-scroll">
-      <table class="data">
-        <thead><tr><th>Date</th><th>Borrow APY</th><th>Yield APY</th><th>RWA APY</th><th>Delta (Yield−Borrow)</th></tr></thead>
-        <tbody>
-          {chart['table_rows']}
-        </tbody>
-      </table>
-    </div>
-  </details>
-
-  <footer>
-    <span>Snapshot + history from Morpho GraphQL (api.morpho.org) — not auto-refreshing. Ask for an updated read, or ask to schedule one.</span>
-    <span><a href="https://etherscan.io/address/{wallet}" target="_blank" rel="noopener">wallet ↗</a></span>
-  </footer>
+<footer id="method">
+  <p><a class="cta" href="{esc(CONFIG['app_url'])}" target="_blank" rel="noopener">View the fund in the KPK app ↗</a></p>
+  <p><b>Data.</b> Live figures are read at each build from the Morpho API (api.morpho.org): the LsETH/USDC market, the trading subaccount's position, and the two KPK USDC vaults' net APY and share-price history. LsETH's staking APY comes from DefiLlama's Liquid Collective pool. LsETH is marked at the market oracle's price.</p>
+  <p><b>Reading the numbers.</b> ≈ marks a derived or rounded figure. Carry = LTV × (vault yield - borrow rate) × (1 - {PERF_FEE * 100:.0f}% performance fee), on the LsETH held and on top of its staking yield. Carry figures use live and trailing rates read at each build, not a backtest, and are not promises.</p>
+  <p><b>Updates.</b> Rebuilt every 4 hours from public, keyless sources; the page does not refresh itself in the browser ({ext(actions_url, 'rebuild now ↗')}). Contracts: {addr(wallet, 'trading subaccount')} · {addr(CONTRACTS['vault'], 'Upshift vault')} · {addr(CONTRACTS['shares'], 'shares')} · {addr(CONTRACTS['nav_calculator'], 'NAV calculator')}.</p>
+</footer>
 
 </div>
-
-<script>
-(function() {{
-  // Append the reading's age to the timestamp, and mark it if a scheduled rebuild
-  // looks to have been missed. Computed in the viewer's browser because the page
-  // is static -- the build can only stamp when it ran, not how old that is now.
-  var el = document.getElementById('asOf');
-  if (!el) return;
-  var built = parseInt(el.getAttribute('data-built'), 10);
-  if (!built) return;
-  var mins = Math.floor((Date.now() / 1000 - built) / 60);
-  if (mins < 0) return;                       // clock skew; say nothing
-  var age = mins < 60 ? mins + 'm ago'
-    : mins < 1440 ? Math.floor(mins / 60) + 'h ago'
-    : Math.floor(mins / 1440) + 'd ago';
-  el.textContent = el.textContent + ' · ' + age;
-  if (mins > 300) el.classList.add('stale');  // >5h: the 4-hourly run slipped
-}})();
-</script>
-
-<script>
-(function() {{
-  // LTV sensitivity. Carry = spread x LTV, with the spread held at its live
-  // value -- see the on-page caveat: real spreads compress as LTV rises, so the
-  // high end is an upper bound.
-  var SPREAD = {default_spread:.6f};   // mutable: the spread picker reassigns this
-  var LIVE_LTV = {ltv:.4f};
-  var LLTV = {lltv:.2f};
-  // Must match the CSS gradient stops. Four bands: green to SAFE_MAX, olive
-  // through the 75% operating target, orange above it, red near liquidation.
-  var SAFE_MAX = 70, TARGET_MAX = 75, WARN_MAX = 80;
-  var NET_OF_FEE = {net_fee_multiplier:.2f};   // 10% performance fee, as in the Phase 1 backtest
-  var LSETH_APY = {lseth_apy_js};              // null if the staking rate fetch failed
-
-  var slider = document.getElementById('ltvSlider');
-  if (!slider) return;
-
-  // Reference marks on the LTV axis. The liquidation threshold is the red end of
-  // the track itself, labelled once to the right of the scale, so it needs no mark.
-  var MARKS = [
-    {{ ltv: LIVE_LTV, label: 'live ' + LIVE_LTV.toFixed(0) + '%' }},
-    {{ ltv: 62.5, label: 'band 60–65%', optional: true }},
-    {{ ltv: 75, label: 'target 75%', emphasis: true, optional: true }}
-  ].filter(function(m) {{
-    // Drop any contextual mark the live mark sits on top of. The position now runs
-    // AT the 75% production target, so most days the target mark would print
-    // directly under the live one; when they part (the HF band lets LTV breathe a
-    // point or two either side), the target mark comes back on its own.
-    return !(m.optional && Math.abs(m.ltv - LIVE_LTV) < 6);
-  }});
-  // When live sits on the target, say so on the live mark instead.
-  if (Math.abs(LIVE_LTV - 75) < 6) {{
-    MARKS[0].label = 'live ' + LIVE_LTV.toFixed(0) + '% (target)';
-    MARKS[0].emphasis = true;
-  }}
-  var scale = document.getElementById('ltvScale');
-  var markEls = [];
-  MARKS.forEach(function(m) {{
-    var el = document.createElement('button');
-    el.type = 'button';
-    el.className = 'mark';
-    el.title = 'Set LTV to ' + m.ltv.toFixed(0) + '%';
-    el.addEventListener('click', function() {{
-      slider.value = m.ltv;
-      render(m.ltv);
-    }});
-    markEls.push({{ el: el, ltv: m.ltv }});
-    // Match the thumb's real travel: centre goes from +r to (width - r).
-    var f = m.ltv / LLTV;
-    el.style.left = 'calc(' + (f * 100) + '% + ' + ((0.5 - f) * 20) + 'px)';
-    el.textContent = m.label;
-    if (m.emphasis) el.classList.add('is-target');
-    if (m.optional) el.classList.add('is-optional');
-    // The end marks would otherwise hang off the track; anchor them inward so
-    // the text stays inside the card while the tick still points at the value.
-    // 0.85 rather than 0.88: the 75% target sits at 87% of an 86% LLTV scale, so
-    // a higher threshold left it centred and overlapping the liquidation label.
-    if (f >= 0.99) {{ el.classList.add('at-end'); el.style.transform = 'translateX(-100%)'; el.style.textAlign = 'right'; }}
-    else if (f <= 0.01) {{ el.classList.add('at-start'); el.style.transform = 'translateX(0)'; el.style.textAlign = 'left'; }}
-    else if (f > 0.8) {{
-      // Left-anchor marks close to the end: the final mark is right-anchored, so
-      // leaving this one centred makes the pair converge as the track narrows.
-      el.classList.add('at-start'); el.style.transform = 'translateX(0)'; el.style.textAlign = 'left';
-    }}
-    scale.appendChild(el);
-  }});
-
-  // Inverse of carry = spread x LTV x (1 - fee). Returns the required LTV so the
-  // label and the reachability colour derive from ONE number -- computing them
-  // separately previously let them disagree by the fee factor, showing a green
-  // tile that still read "needs a wider spread".
-  function ltvNeededFor(target) {{
-    return SPREAD > 0 ? target / (SPREAD * NET_OF_FEE) * 100 : Infinity;
-  }}
-
-  function ltvLabel(need) {{
-    // Not reachable *at the selected spread* -- a wider spread lowers the
-    // required LTV, so this is about current conditions, not a permanent
-    // ceiling. Word it that way rather than printing a fake number.
-    if (!isFinite(need)) return 'n/a at a negative spread';
-    return need > LLTV ? 'needs a wider spread' : need.toFixed(0) + '% LTV';
-  }}
-
-  function render(ltv) {{
-    var carry = SPREAD * ltv / 100 * NET_OF_FEE;
-    var txt = (carry >= 0 ? '+' : '') + carry.toFixed(2) + '%';
-
-    document.getElementById('sliderCarry').textContent = txt;
-    document.getElementById('sliderLtv').textContent = ltv.toFixed(0) + '%';
-    document.getElementById('heroCarry').textContent = txt;
-    document.getElementById('heroLtv').textContent = ltv.toFixed(0) + '%';
-    document.getElementById('mathLtv').textContent = ltv.toFixed(0) + '%';
-    document.getElementById('mathCarry').textContent = txt;
-    document.getElementById('perUnitLtv').textContent = ltv.toFixed(0);
-
-    var perUnit = {lseth_price:.4f} * ltv / 100;
-    var money = perUnit.toLocaleString(undefined, {{ maximumFractionDigits: 0 }});
-    document.getElementById('perUnitBorrow').textContent = money;
-    document.getElementById('perUnitDeposit').textContent = money;
-
-    var pill = document.getElementById('carryPill');
-    pill.textContent = carry > 0 ? '↑ carry positive' : '↓ carry negative';
-    pill.className = 'pill ' + (carry > 0 ? 'good' : 'bad');
-
-    // Thumb takes the risk tier of wherever it now sits.
-    slider.style.setProperty('--thumb-color', 'var(--' + riskTier(ltv) + ')');
-
-    // Highlight a preset only when the slider is actually parked on it.
-    markEls.forEach(function(m) {{
-      m.el.setAttribute('aria-current', Math.abs(m.ltv - ltv) < 0.5 ? 'true' : 'false');
-    }});
-
-    // Total APY = lsETH staking + carry. Absent when the staking rate couldn't
-    // be fetched, so guard rather than assume the element exists.
-    var totalEl = document.getElementById('totalApy');
-    if (totalEl && LSETH_APY !== null) {{
-      totalEl.textContent = (LSETH_APY + carry).toFixed(2) + '%';
-      document.getElementById('carryPart').textContent = carry.toFixed(2);
-    }}
-
-  }}
-
-  // Depends on the spread rather than the slider, so it recomputes when the
-  // spread changes. Colour carries reachability: green where a safe LTV gets
-  // there, muted where the required LTV would exceed liquidation.
-  // Shared with the track gradient and the thumb, so one LTV never reads as two
-  // different risk levels in two places on the page.
-  function riskTier(ltv) {{
-    return ltv <= SAFE_MAX ? 'risk-lo'
-      : ltv <= TARGET_MAX ? 'risk-mid'
-      : ltv <= WARN_MAX ? 'risk-warn'
-      : 'risk-hi';
-  }}
-
-  function renderTargets() {{
-    [['ltvFor15', 1.5], ['ltvFor20', 2.0], ['ltvFor25', 2.5]].forEach(function(t) {{
-      var need = ltvNeededFor(t[1]);
-      var el = document.getElementById(t[0]);
-      el.textContent = ltvLabel(need);
-      // Tier off the ROUNDED value, which is what the tile displays: 82.05 shown
-      // as "82%" must take the same colour the slider gives 82%, or the two
-      // disagree at the band boundary.
-      el.parentElement.className = 'target ' +
-        (need <= LLTV ? riskTier(Math.round(need)) : 'unreachable');
-    }});
-  }}
-
-  // Spread picker: switching horizon re-runs the whole simulation at the current
-  // LTV, so the headline, the math strip and the targets all stay consistent.
-  var spreadBtns = [].slice.call(document.querySelectorAll('.spread-btn'));
-  spreadBtns.forEach(function(btn) {{
-    btn.addEventListener('click', function() {{
-      SPREAD = parseFloat(btn.getAttribute('data-spread'));
-      spreadBtns.forEach(function(b) {{
-        b.setAttribute('aria-current', b === btn ? 'true' : 'false');
-      }});
-      var basis = btn.querySelector('i').textContent;
-      document.getElementById('spreadBasis').textContent = basis;
-
-      // Move the whole working strip onto the selected basis. All three terms
-      // must change together: a spot yield minus a spot borrow shown next to a
-      // 30d spread is an equation that visibly doesn't add up.
-      var yv = parseFloat(btn.getAttribute('data-yield'));
-      var bv = parseFloat(btn.getAttribute('data-borrow'));
-      var isSpot = basis === 'Live';
-      document.getElementById('mathYield').textContent = yv.toFixed(2) + '%';
-      document.getElementById('mathBorrow').textContent = bv.toFixed(2) + '%';
-      document.getElementById('mathDelta').textContent = SPREAD.toFixed(2) + ' pp';
-      document.getElementById('mathYieldSub').textContent = isSpot ? 'Yield APY' : 'Yield, ' + basis;
-      document.getElementById('mathBorrowSub').textContent = isSpot ? 'Borrow APY' : 'Borrow, ' + basis;
-      document.getElementById('spreadBasisTop').textContent =
-        isSpot ? 'live spot rates' : basis + ' (trailing)';
-      // Keep the hero's spread card in step with the picker, and say which
-      // basis it's showing -- otherwise it silently contradicts the simulation.
-      document.getElementById('spreadTop').textContent =
-        (SPREAD >= 0 ? '+' : '') + SPREAD.toFixed(2) + ' pp';
-      renderTargets();
-      render(parseFloat(slider.value));
-    }});
-  }});
-
-  slider.addEventListener('input', function() {{ render(parseFloat(slider.value)); }});
-  renderTargets();
-  render(parseFloat(slider.value));
-}})();
-</script>
-
+<script>window.SIM = {json.dumps(sim)};</script>
+<script>{JS}</script>
 <script>
 (function() {{
   var borrow = {chart['borrow_js']};
   var yieldp = {chart['yield_js']};
   var rwap = {chart['rwa_js']};
   var scale = {{ x0: {chart['scale']['x0']}, x1: {chart['scale']['x1']}, padL: {chart['scale']['pad_l']}, plotW: {chart['scale']['plot_w']} }};
-  var svg = document.querySelector('.chart-svg');
+  var svg = document.getElementById('rateChart');
   var rect = document.getElementById('hoverRect');
   var crosshair = document.getElementById('crosshair');
   var tooltip = document.getElementById('chartTooltip');
@@ -1591,40 +1367,42 @@ html = f"""<!doctype html>
   }}
 
   function fmtDate(t) {{
-    return new Date(t * 1000).toLocaleDateString(undefined, {{ year: 'numeric', month: 'short', day: 'numeric', timeZone: 'UTC' }});
+    return new Date(t * 1000).toLocaleDateString('en-GB', {{ year: 'numeric', month: 'short', day: 'numeric', timeZone: 'UTC' }});
   }}
 
+  function show(e) {{
+    var box = svg.getBoundingClientRect();
+    var px = e.clientX - box.left;
+    var frac = Math.max(0, Math.min(1, (px * (840 / box.width) - scale.padL) / scale.plotW));
+    var t = scale.x0 + frac * (scale.x1 - scale.x0);
+    var b = nearest(borrow, t), y = nearest(yieldp, t);
+    var xv = (b[0] - scale.x0) / (scale.x1 - scale.x0) * scale.plotW + scale.padL;
+    crosshair.setAttribute('x1', xv);
+    crosshair.setAttribute('x2', xv);
+    crosshair.setAttribute('visibility', 'visible');
+
+    elDate.textContent = fmtDate(b[0]);
+    elYield.textContent = y[1].toFixed(2) + '%';
+    // RWA only exists from its launch date; the nearest() lookup would
+    // otherwise pin every earlier hover to its first point.
+    var rshow = 'n/a';
+    if (rwap.length) {{
+      var r = nearest(rwap, t);
+      if (Math.abs(r[0] - t) < 129600) rshow = r[1].toFixed(2) + '%';
+    }}
+    elRwa.textContent = rshow;
+    elBorrow.textContent = b[1].toFixed(2) + '%';
+    var d = y[1] - b[1];
+    elDelta.textContent = (d >= 0 ? '+' : '') + d.toFixed(2) + ' pp';
+
+    // Keep the tooltip inside the chart box at both ends.
+    var cx = xv / 840 * box.width, w = tooltip.offsetWidth || 160;
+    tooltip.style.left = Math.max(w / 2, Math.min(box.width - w / 2, cx)) + 'px';
+    tooltip.style.visibility = 'visible';
+  }}
   if (rect) {{
-    rect.addEventListener('pointermove', function(e) {{
-      var box = svg.getBoundingClientRect();
-      var px = e.clientX - box.left;
-      var frac = Math.max(0, Math.min(1, (px * (840 / box.width) - scale.padL) / scale.plotW));
-      var t = scale.x0 + frac * (scale.x1 - scale.x0);
-      var b = nearest(borrow, t), y = nearest(yieldp, t);
-
-      var cx = (scale.padL + (b[0] - scale.x0) / (scale.x1 - scale.x0) * scale.plotW) / 840 * box.width;
-      crosshair.setAttribute('x1', (b[0] - scale.x0) / (scale.x1 - scale.x0) * scale.plotW + scale.padL);
-      crosshair.setAttribute('x2', (b[0] - scale.x0) / (scale.x1 - scale.x0) * scale.plotW + scale.padL);
-      crosshair.setAttribute('visibility', 'visible');
-
-      elDate.textContent = fmtDate(b[0]);
-      elYield.textContent = y[1].toFixed(2) + '%';
-      // RWA only exists from its launch date; the nearest() lookup would
-      // otherwise pin every earlier hover to its first point.
-      var rshow = '—';
-      if (rwap.length) {{
-        var r = nearest(rwap, t);
-        if (Math.abs(r[0] - t) < 129600) rshow = r[1].toFixed(2) + '%';
-      }}
-      elRwa.textContent = rshow;
-      elBorrow.textContent = b[1].toFixed(2) + '%';
-      var d = y[1] - b[1];
-      elDelta.textContent = (d >= 0 ? '+' : '') + d.toFixed(2) + ' pp';
-
-      tooltip.style.left = cx + 'px';
-      tooltip.style.top = (e.clientY - box.top) + 'px';
-      tooltip.style.visibility = 'visible';
-    }});
+    rect.addEventListener('pointermove', show);
+    rect.addEventListener('pointerdown', show);
     rect.addEventListener('pointerleave', function() {{
       crosshair.setAttribute('visibility', 'hidden');
       tooltip.style.visibility = 'hidden';
@@ -1632,8 +1410,10 @@ html = f"""<!doctype html>
   }}
 }})();
 </script>
+{share_js}
+</body>
 </html>
 """
 
-OUT.write_text(html)
-print(f"wrote {OUT} ({len(html):,} chars)")
+OUT.write_text(page)
+print(f"wrote {OUT} ({len(page):,} chars)")
