@@ -34,7 +34,7 @@ USDC_YIELD_VAULT = "0xD5cCe260E7a755DDf0Fb9cdF06443d593AaeaA13"
 USDC_YIELD_RWA_VAULT = "0x7a72bcD2c3F7F7e4D6679170a0625bAB15D7DDa1"
 
 HISTORY_QUERY = """
-query($marketId: String!, $vault: String!, $rwaVault: String!, $chainId: Int!, $opts: TimeseriesOptions!) {
+query($marketId: String!, $vault: String!, $rwaVault: String!, $wallet: String!, $chainId: Int!, $opts: TimeseriesOptions!) {
   marketById(marketId: $marketId, chainId: $chainId) {
     creationTimestamp
     historicalState {
@@ -44,14 +44,20 @@ query($marketId: String!, $vault: String!, $rwaVault: String!, $chainId: Int!, $
   }
   vaultV2ByAddress(address: $vault, chainId: $chainId) {
     historicalState {
-      avgNetApy(options: $opts) { x y }
+      avgNetApy(options: $opts, lookbackHours: 24) { x y }
       sharePrice(options: $opts) { x y }
     }
   }
   rwa: vaultV2ByAddress(address: $rwaVault, chainId: $chainId) {
     historicalState {
-      avgNetApy(options: $opts) { x y }
+      avgNetApy(options: $opts, lookbackHours: 24) { x y }
     }
+  }
+  yieldPos: vaultV2PositionByAddress(userAddress: $wallet, vaultAddress: $vault, chainId: $chainId) {
+    history { assets(options: $opts) { x y } }
+  }
+  rwaPos: vaultV2PositionByAddress(userAddress: $wallet, vaultAddress: $rwaVault, chainId: $chainId) {
+    history { assets(options: $opts) { x y } }
   }
 }
 """
@@ -514,7 +520,7 @@ def fetch_apy_history(interval: str = "DAY") -> dict:
     }
     data = _post(HISTORY_QUERY, {
         "marketId": LSETH_USDC_MARKET_ID, "vault": USDC_YIELD_VAULT,
-        "rwaVault": USDC_YIELD_RWA_VAULT, "chainId": 1, "opts": opts,
+        "rwaVault": USDC_YIELD_RWA_VAULT, "wallet": DEFAULT_WALLET, "chainId": 1, "opts": opts,
     })
 
     def _series(points):
@@ -532,13 +538,47 @@ def fetch_apy_history(interval: str = "DAY") -> dict:
     def _from_creation(series):
         return [p for p in series if p["t"] >= creation]
 
+    # Morpho caps avgNetApy's lookback at 24h, and single days spike, so the
+    # vault lines are the 7-day mean of the daily realized rate. That rate is
+    # net of fees and includes rewards (Merkl), per Morpho's field docs.
+    def _rolling(series, days=7):
+        out = []
+        for p in series:
+            window = [q["y"] for q in series if p["t"] - days * 86400 < q["t"] <= p["t"]]
+            out.append({"t": p["t"], "y": sum(window) / len(window)})
+        return out
+
+    yield_apy = _rolling(_series(vault_hist["avgNetApy"]))
+    rwa_apy = _rolling(_series(data["rwa"]["historicalState"]["avgNetApy"]))
+
+    # The fund's blended deposit rate: both vault rates weighted by the
+    # subaccount's actual balance in each vault that day.
+    def _by_date(series):
+        return {time.strftime("%Y-%m-%d", time.gmtime(p["t"])): p for p in series}
+
+    def _assets(pos):
+        pts = ((pos or {}).get("history") or {}).get("assets") or []
+        return {time.strftime("%Y-%m-%d", time.gmtime(p["x"])): float(p["y"] or 0) for p in pts}
+
+    yield_assets, rwa_assets = _assets(data.get("yieldPos")), _assets(data.get("rwaPos"))
+    rwa_by_date = _by_date(rwa_apy)
+    blended = []
+    for d, p in _by_date(yield_apy).items():
+        r = rwa_by_date.get(d)
+        wy = yield_assets.get(d, 0.0)
+        wr = rwa_assets.get(d, 0.0) if r else 0.0
+        if wy + wr <= 0:
+            continue  # no deposit that day (before the position opened)
+        blended.append({"t": p["t"], "y": (p["y"] * wy + (r["y"] if r else 0) * wr) / (wy + wr)})
+
     return {
         "since": creation,
         "borrow_apy_pct": _from_creation(_series(market_hist["borrowApy"])),
-        "yield_apy_pct": _from_creation(_series(vault_hist["avgNetApy"])),
+        "yield_apy_pct": _from_creation(yield_apy),
         # The second deploy vault (launched 2026-07-28, in this position since
         # 2026-08-27). Its series simply starts when the vault does; no padding.
-        "rwa_apy_pct": _from_creation(_series(data["rwa"]["historicalState"]["avgNetApy"])),
+        "rwa_apy_pct": _from_creation(rwa_apy),
+        "blended_apy_pct": _from_creation(sorted(blended, key=lambda p: p["t"])),
         "borrow_apy_30d_pct": _from_creation(_series(market_hist["monthlyBorrowApy"])),
         "yield_apy_30d_pct": _from_creation(
             _share_price_apy(vault_hist["sharePrice"], window_days=trend_window)
