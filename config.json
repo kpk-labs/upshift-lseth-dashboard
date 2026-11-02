@@ -47,6 +47,12 @@
       {"t": "2026-08-27 17:00", "label": "LTV to 75%"}
     ]
   },
+  "rebalance_chart": {
+    "_readme": "The LsETH oracle price against the agent's Borrows and Repays. band_from (UTC) is when the current health factor settings began, the 27 Aug move to the 75% LTV target; the no-action corridor is drawn from then, because the settings before it differed.",
+    "title": "LsETH oracle price against agent rebalances",
+    "band_from": "2026-08-27 17:00",
+    "caption": "The shaded corridor is the liquidation price times the health factor band of {repay_below} to {borrow_above}, drawn with today's settings from 27 Aug, when the {target_ltv} LTV target began; inside it the agent does nothing, and each triangle is a Borrow or Repay it sent onchain."
+  },
   "backtest": {
     "summary": "Backtest cross-check: +2.11% a year at 75% LTV over 180 days",
     "text": "Over the 180 days to 30 Jul 2026, on reconstructed onchain borrow rates and the vault's realised share price, this strategy at 75% LTV averaged +2.11% net over LsETH: monthly range 1.32% to 3.17%, with the 1.5% floor cleared on 75% of days. That run used deeper 86%-LLTV proxy markets, because LsETH/USDC had no rate history at the time; its own 45 days since have averaged 4.01% borrow at 89% utilisation, against the proxy's 4.01%."
