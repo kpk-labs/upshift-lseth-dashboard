@@ -468,6 +468,43 @@ def price_at(points, t):
     return a["px"] + (b["px"] - a["px"]) * (t - a["t"]) / (b["t"] - a["t"])
 
 
+def liq_at(points, t):
+    """Liquidation price on the drawn line at time t, linear between the two readings around it;
+    None outside the readings or where either reading has no debt."""
+    for a, b in zip(points, points[1:]):
+        if a["t"] <= t <= b["t"]:
+            if a["liq"] is None or b["liq"] is None:
+                return None
+            return a["liq"] + (b["liq"] - a["liq"]) * (t - a["t"]) / (b["t"] - a["t"])
+    return None
+
+
+def band_spans(bands, points):
+    """Each configured health factor band as the stretch of the chart it covers, [from, to, repay
+    trigger, borrow trigger] in epoch seconds, cut to the readings. An open-ended band runs to the
+    latest reading."""
+    t0, t1 = points[0]["t"], points[-1]["t"]
+    spans = []
+    for b in bands:
+        a = max(utc_ts(b["from"]), t0)
+        z = min(utc_ts(b["to"]), t1) if b.get("to") else t1
+        if z > a:
+            spans.append([a, z, b["repay_below"], b["borrow_above"]])
+    return sorted(spans)
+
+
+def uncovered(spans, t0, t1, min_gap=6 * 3600):
+    """The stretches of [t0, t1] that no band covers, ignoring any shorter than min_gap seconds."""
+    gaps, cursor = [], t0
+    for a, z, _, _ in spans:
+        if a - cursor >= min_gap:
+            gaps.append((cursor, a))
+        cursor = max(cursor, z)
+    if t1 - cursor >= min_gap:
+        gaps.append((cursor, t1))
+    return gaps
+
+
 def build_rebalance_chart(history, start):
     """LsETH oracle price in USD since the position opened, against the liquidation price of the loan,
     the no-action corridor (liquidation price x the health factor band) and each Borrow and Repay
@@ -480,14 +517,21 @@ def build_rebalance_chart(history, start):
     t_open = start["timestamp"] if start else actions[0]["t"]
     x0, x1 = min(t_open, all_pts[0]["t"]), all_pts[-1]["t"]
     pts = thin_hours(all_pts)
-    band_from = utc_ts(REBALANCE_CFG["band_from"])
-    lo_band, hi_band = CONFIG["health_factor_manager"]["repay_below"], CONFIG["health_factor_manager"]["borrow_above"]
+    spans = band_spans(REBALANCE_CFG["bands"], pts)
+    live = CONFIG["health_factor_manager"]
+    if spans and spans[-1][2:] != [live["repay_below"], live["borrow_above"]]:
+        print("rebalance chart: the latest band differs from health_factor_manager", file=sys.stderr)
 
-    def corridor(p):
-        return (p["liq"] * lo_band, p["liq"] * hi_band) if p["liq"] is not None and p["t"] >= band_from else None
+    def band_edges(span):
+        """The band's own stretch as (time, liquidation price x repay trigger, x borrow trigger)."""
+        a, z, lo, hi = span
+        inner = [(p["t"], p["liq"]) for p in pts if a < p["t"] < z]
+        line = [(a, liq_at(pts, a))] + inner + [(z, liq_at(pts, z))]
+        return [(t, v * lo, v * hi) for t, v in line if v is not None]
 
+    corridors = [band_edges(sp) for sp in spans]
     values = [p["px"] for p in pts] + [p["liq"] for p in pts if p["liq"] is not None]
-    values += [c[1] for c in map(corridor, pts) if c]
+    values += [e[2] for c in corridors for e in c]
     y_lo, y_hi = min(values) * 0.97, max(values) * 1.03
     raw = (y_hi - y_lo) / 5
     mag = 10 ** math.floor(math.log10(raw))
@@ -524,20 +568,24 @@ def build_rebalance_chart(history, start):
         return " ".join(d)
 
     # The corridor: where the position sits inside the health factor band, so the agent does nothing.
-    # Drawn only from the date the current settings began; before that the band was different.
-    inside = [p for p in pts if corridor(p)]
+    # Each band is drawn for the stretch its own settings were in force; stretches with no band on
+    # record are greyed.
     corridor_svg = ""
-    if len(inside) >= 2:
-        upper = [(p["t"], corridor(p)[1]) for p in inside]
-        lower = [(p["t"], corridor(p)[0]) for p in inside]
+    for c in corridors:
+        if len(c) < 2:
+            continue
+        upper = [(t, hi) for t, _, hi in c]
+        lower = [(t, lo) for t, lo, _ in c]
         ring = " ".join(f"{sx(t):.1f},{sy(v):.1f}" for t, v in upper + lower[::-1])
-        corridor_svg = (f'<polygon class="rb-band" points="{ring}"/>'
-                        f'<path class="rb-band-edge" d="{poly_path(upper)}"/><path class="rb-band-edge" d="{poly_path(lower)}"/>')
+        corridor_svg += (f'<polygon class="rb-band" points="{ring}"/>'
+                         f'<path class="rb-band-edge" d="{poly_path(upper)}"/><path class="rb-band-edge" d="{poly_path(lower)}"/>')
     phase_svg = ""
-    if inside and x0 < inside[0]["t"]:
-        xe = sx(inside[0]["t"])
-        phase_svg = (f'<rect class="rb-phase" x="{pad_l}" y="{pad_t}" width="{xe - pad_l:.1f}" height="{plot_h}"/>'
-                     f'<text x="{pad_l + 6}" y="{pad_t + 14}" class="chart-marklabel">earlier settings</text>')
+    for ga, gz in uncovered(spans, pts[0]["t"], x1):
+        xa, xz = sx(ga), sx(gz)
+        mid = (xa + xz) / 2
+        phase_svg += (f'<rect class="rb-phase" x="{xa:.1f}" y="{pad_t}" width="{xz - xa:.1f}" height="{plot_h}"/>'
+                      f'<text x="{mid:.1f}" y="{pad_t + plot_h - 8}" class="chart-marklabel" '
+                      f'transform="rotate(-90 {mid:.1f} {pad_t + plot_h - 8})">no band in force</text>')
 
     liq_path = poly_path([(p["t"], p["liq"]) for p in pts])
     px_path = poly_path([(p["t"], p["px"]) for p in pts])
@@ -587,7 +635,7 @@ def build_rebalance_chart(history, start):
         "acts_js": json.dumps([[a["t"], a["kind"], round(a.get("usdc") or a.get("lseth"), 2)] for a in actions
                                if x0 <= a["t"] <= x1], separators=(",", ":")),
         "scale": {"x0": x0, "x1": x1, "pad_l": pad_l, "plot_w": plot_w, "w": W,
-                  "band_from": band_from, "lo": lo_band, "hi": hi_band},
+                  "bands": spans},
         "price": all_pts[-1]["px"], "price_open": all_pts[0]["px"],
         "n": len(rebalances), "n_relever": len(relevers), "n_repay": len(repays),
         "usdc_borrowed": sum(a["usdc"] for a in relevers), "usdc_repaid": sum(a["usdc"] for a in repays),
@@ -854,7 +902,7 @@ if rebalance_chart:
 (function() {{
   var pts = {rebalance_chart['pts_js']};
   var acts = {rebalance_chart['acts_js']};
-  var S = {{ x0: {sc['x0']}, x1: {sc['x1']}, padL: {sc['pad_l']}, plotW: {sc['plot_w']}, w: {sc['w']}, bandFrom: {sc['band_from']}, lo: {sc['lo']}, hi: {sc['hi']} }};
+  var S = {{ x0: {sc['x0']}, x1: {sc['x1']}, padL: {sc['pad_l']}, plotW: {sc['plot_w']}, w: {sc['w']}, bands: {json.dumps(sc['bands'])} }};
   var svg = document.getElementById('rbChart');
   var rect = document.getElementById('rbHover');
   var crosshair = document.getElementById('rbCrosshair');
@@ -883,11 +931,13 @@ if rebalance_chart:
     crosshair.setAttribute('visibility', 'visible');
     document.getElementById('rbDate').textContent = new Date(p[0] * 1000).toLocaleString('en-GB', {{ day: 'numeric', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit', timeZone: 'UTC' }}) + ' UTC';
     document.getElementById('rbPx').textContent = usd(p[1]);
-    var hasLiq = p[2] !== null, hasBand = hasLiq && p[0] >= S.bandFrom;
+    var band = null;
+    S.bands.forEach(function(b) {{ if (p[0] >= b[0] && p[0] <= b[1]) band = b; }});
+    var hasLiq = p[2] !== null, hasBand = hasLiq && band !== null;
     document.getElementById('rbLiqRow').style.display = hasLiq ? '' : 'none';
     document.getElementById('rbBandRow').style.display = hasBand ? '' : 'none';
     if (hasLiq) document.getElementById('rbLiq').textContent = usd(p[2]);
-    if (hasBand) document.getElementById('rbBand').textContent = usd(p[2] * S.lo) + ' to ' + usd(p[2] * S.hi);
+    if (hasBand) document.getElementById('rbBand').textContent = usd(p[2] * band[2]) + ' to ' + usd(p[2] * band[3]);
     var box2 = document.getElementById('rbActs');
     while (box2.firstChild) box2.removeChild(box2.firstChild);
     var tol = 7 * (S.x1 - S.x0) / S.plotW;
