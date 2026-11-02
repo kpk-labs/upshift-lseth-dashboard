@@ -322,6 +322,101 @@ def fetch_strategy_start(wallet: str = DEFAULT_WALLET) -> dict | None:
     }
 
 
+ACTIONS_QUERY = """
+query($wallet: [String!], $marketId: [String!], $skip: Int) {
+  marketTransactions(
+    first: 200
+    skip: $skip
+    orderBy: Timestamp
+    orderDirection: Asc
+    where: { userAddress_in: $wallet, marketUniqueKey_in: $marketId, chainId_in: [1] }
+  ) {
+    items {
+      timestamp
+      type
+      txHash
+      data {
+        __typename
+        ... on MarketTransactionTransferData { assets }
+        ... on MarketTransactionCollateralTransferData { assets }
+      }
+    }
+  }
+}
+"""
+
+POSITION_HISTORY_QUERY = """
+query($wallet: String!, $marketId: String!, $opts: TimeseriesOptions) {
+  marketPosition(userAddress: $wallet, marketUniqueKey: $marketId, chainId: 1) {
+    market { lltv }
+    historicalState {
+      collateral(options: $opts) { x y }
+      collateralValue(options: $opts) { x y }
+      borrowAssets(options: $opts) { x y }
+    }
+  }
+}
+"""
+
+# A deposit or withdrawal of collateral smaller than this (in LsETH) is dust, not a flow
+# worth a line on the chart.
+MIN_COLLATERAL_FLOW_LSETH = 1.0
+
+
+def fetch_rebalance_history(wallet: str = DEFAULT_WALLET) -> dict:
+    """What the health factor manager did to the loan, and the price it did it against.
+
+    `actions` are the wallet's own Borrow and Repay on the LsETH/USDC market, oldest first
+    (`relever` = a Borrow, `derisk` = a Repay), plus its collateral supplies and withdrawals
+    (`deposit`, `withdraw`). A Borrow sent in the same transaction as the collateral supply is the
+    opening of the position, not a rebalance, and is labelled `open`.
+
+    `points` is one reading per hour since the position opened: the market's oracle price in USD
+    per LsETH (the position's collateral value in USDC over its collateral, which is the
+    oracle's own number) and the liquidation price of the loan at that hour (debt over collateral
+    times LLTV; None while there is no debt). Both come from the keyless Morpho API."""
+    items, skip = [], 0
+    while True:
+        page = _post(ACTIONS_QUERY, {"wallet": [wallet], "marketId": [LSETH_USDC_MARKET_ID],
+                                     "skip": skip})["marketTransactions"]["items"]
+        items += page
+        if len(page) < 200:
+            break
+        skip += 200
+    supply_txs = {i["txHash"] for i in items if i["type"] == "SupplyCollateral"}
+    actions = []
+    for i in items:
+        raw = int((i.get("data") or {}).get("assets") or 0)
+        if i["type"] in ("Borrow", "Repay"):
+            usdc = raw / 1e6
+            if usdc <= TEST_TX_USDC_CEILING:
+                continue
+            kind = "derisk" if i["type"] == "Repay" else "open" if i["txHash"] in supply_txs else "relever"
+            actions.append({"t": int(i["timestamp"]), "kind": kind, "usdc": usdc, "tx": i["txHash"]})
+        elif i["type"] in ("SupplyCollateral", "WithdrawCollateral") and raw / 1e18 >= MIN_COLLATERAL_FLOW_LSETH:
+            actions.append({"t": int(i["timestamp"]), "tx": i["txHash"], "lseth": raw / 1e18,
+                            "kind": "deposit" if i["type"] == "SupplyCollateral" else "withdraw"})
+    if not actions:
+        return {"lltv": None, "points": [], "actions": []}
+
+    pos = _post(POSITION_HISTORY_QUERY, {
+        "wallet": wallet, "marketId": LSETH_USDC_MARKET_ID,
+        "opts": {"startTimestamp": actions[0]["t"] - 3600, "endTimestamp": int(time.time()), "interval": "HOUR"},
+    })["marketPosition"]
+    lltv = int(pos["market"]["lltv"]) / 1e18
+    hs = pos["historicalState"]
+    coll = {p["x"]: int(p["y"]) / 1e18 for p in hs["collateral"]}
+    value = {p["x"]: int(p["y"]) / 1e6 for p in hs["collateralValue"]}
+    debt = {p["x"]: int(p["y"]) / 1e6 for p in hs["borrowAssets"]}
+    points = []
+    for t in sorted(coll):
+        if coll[t] <= 0 or t not in value or t not in debt:
+            continue
+        points.append({"t": t, "px": value[t] / coll[t],
+                       "liq": debt[t] / (coll[t] * lltv) if debt[t] > 0 else None})
+    return {"lltv": lltv, "points": points, "actions": actions}
+
+
 LLAMA_POOLS = "https://yields.llama.fi/pools"
 
 
@@ -624,8 +719,11 @@ def main():
     parser.add_argument("--history", action="store_true", help="print full APY history instead of the position snapshot")
     parser.add_argument("--start", action="store_true", help="print when this wallet actually opened the carry position")
     parser.add_argument("--peers", action="store_true", help="compare the borrow rate against comparable 86%%-LLTV USDC markets")
+    parser.add_argument("--rebalances", action="store_true", help="print the wallet's Borrow/Repay history and the hourly oracle price")
     args = parser.parse_args()
-    if args.history:
+    if args.rebalances:
+        print(json.dumps(fetch_rebalance_history(args.wallet), indent=2))
+    elif args.history:
         print(json.dumps(fetch_apy_history(), indent=2))
     elif args.start:
         print(json.dumps(fetch_strategy_start(args.wallet), indent=2))

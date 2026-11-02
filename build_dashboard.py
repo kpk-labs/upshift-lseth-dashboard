@@ -428,6 +428,175 @@ share_rows = load_share_rows()
 append_share_reading(share_rows)
 share_chart = build_share_chart(share_rows, start)
 
+REBALANCE_CFG = CONFIG["rebalance_chart"]
+
+
+def load_rebalance_history():
+    """The wallet's Borrow and Repay history and the hourly oracle price. A failed read must
+    never fail the build: the chart is simply left out until the next run."""
+    try:
+        return pt.fetch_rebalance_history(data["wallet"])
+    except Exception as e:
+        print(f"rebalance history skipped: {e}", file=sys.stderr)
+        return None
+
+
+def thin_hours(points):
+    """One reading per six hours, plus the hours around any step in the liquidation price (a
+    Borrow, Repay or collateral change), so the steps stay sharp while the page stays light."""
+    def moved(a, b):
+        if (a["liq"] is None) != (b["liq"] is None):
+            return True
+        return a["liq"] is not None and abs(b["liq"] / a["liq"] - 1) > 0.002
+
+    jump = [i > 0 and moved(points[i - 1], p) for i, p in enumerate(points)]
+    return [p for i, p in enumerate(points)
+            if i % 6 == 0 or i == len(points) - 1 or jump[i] or (i + 1 < len(points) and jump[i + 1])]
+
+
+def price_at(points, t):
+    """Oracle price at time t, linear between the two hourly readings around it."""
+    if t <= points[0]["t"]:
+        return points[0]["px"]
+    if t >= points[-1]["t"]:
+        return points[-1]["px"]
+    lo, hi = 0, len(points) - 1
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        lo, hi = (mid, hi) if points[mid]["t"] <= t else (lo, mid)
+    a, b = points[lo], points[hi]
+    return a["px"] + (b["px"] - a["px"]) * (t - a["t"]) / (b["t"] - a["t"])
+
+
+def build_rebalance_chart(history, start):
+    """LsETH oracle price in USD since the position opened, against the liquidation price of the loan,
+    the no-action corridor (liquidation price x the health factor band) and each Borrow and Repay
+    the health factor manager sent. Prices come from the market's oracle through the Morpho API; the
+    actions are the trading subaccount's own transactions on the LsETH/USDC market."""
+    if not history or len(history["points"]) < 2:
+        return None
+    all_pts = history["points"]
+    actions = history["actions"]
+    t_open = start["timestamp"] if start else actions[0]["t"]
+    x0, x1 = min(t_open, all_pts[0]["t"]), all_pts[-1]["t"]
+    pts = thin_hours(all_pts)
+    band_from = utc_ts(REBALANCE_CFG["band_from"])
+    lo_band, hi_band = CONFIG["health_factor_manager"]["repay_below"], CONFIG["health_factor_manager"]["borrow_above"]
+
+    def corridor(p):
+        return (p["liq"] * lo_band, p["liq"] * hi_band) if p["liq"] is not None and p["t"] >= band_from else None
+
+    values = [p["px"] for p in pts] + [p["liq"] for p in pts if p["liq"] is not None]
+    values += [c[1] for c in map(corridor, pts) if c]
+    y_lo, y_hi = min(values) * 0.97, max(values) * 1.03
+    raw = (y_hi - y_lo) / 5
+    mag = 10 ** math.floor(math.log10(raw))
+    step = next(m * mag for m in (1, 2, 5, 10) if m * mag >= raw)
+    tick_vals = [k * step for k in range(math.ceil(y_lo / step), math.floor(y_hi / step) + 1)]
+
+    pad_l, pad_r, pad_t, pad_b = 60, 78, 16, 30
+    W, H = 840, 300
+    plot_w, plot_h = W - pad_l - pad_r, H - pad_t - pad_b
+
+    def sx(t):
+        return pad_l + (t - x0) / (x1 - x0) * plot_w
+
+    def sy(v):
+        return pad_t + (1 - (v - y_lo) / (y_hi - y_lo)) * plot_h
+
+    grid = "\n".join(
+        f'<line x1="{pad_l}" y1="{sy(v):.1f}" x2="{W - pad_r}" y2="{sy(v):.1f}" class="chart-grid"/>'
+        f'<text x="{pad_l - 8}" y="{sy(v):.1f}" class="chart-ytick" text-anchor="end" dominant-baseline="middle">${v:,.0f}</text>'
+        for v in tick_vals)
+    xticks = "\n".join(
+        f'<text x="{sx(x0 + (x1 - x0) * i / 4):.1f}" y="{H - pad_b + 18:.1f}" class="chart-xtick" text-anchor="middle">'
+        f'{utc(x0 + (x1 - x0) * i / 4).strftime("%-d %b")}</text>' for i in range(5))
+
+    def poly_path(series):
+        """Path through (t, value) pairs, broken wherever the value is missing."""
+        d, pen_down = [], False
+        for t, v in series:
+            if v is None:
+                pen_down = False
+                continue
+            d.append(f"{'L' if pen_down else 'M'}{sx(t):.1f},{sy(v):.1f}")
+            pen_down = True
+        return " ".join(d)
+
+    # The corridor: where the position sits inside the health factor band, so the agent does nothing.
+    # Drawn only from the date the current settings began; before that the band was different.
+    inside = [p for p in pts if corridor(p)]
+    corridor_svg = ""
+    if len(inside) >= 2:
+        upper = [(p["t"], corridor(p)[1]) for p in inside]
+        lower = [(p["t"], corridor(p)[0]) for p in inside]
+        ring = " ".join(f"{sx(t):.1f},{sy(v):.1f}" for t, v in upper + lower[::-1])
+        corridor_svg = (f'<polygon class="rb-band" points="{ring}"/>'
+                        f'<path class="rb-band-edge" d="{poly_path(upper)}"/><path class="rb-band-edge" d="{poly_path(lower)}"/>')
+    phase_svg = ""
+    if inside and x0 < inside[0]["t"]:
+        xe = sx(inside[0]["t"])
+        phase_svg = (f'<rect class="rb-phase" x="{pad_l}" y="{pad_t}" width="{xe - pad_l:.1f}" height="{plot_h}"/>'
+                     f'<text x="{pad_l + 6}" y="{pad_t + 14}" class="chart-marklabel">earlier settings</text>')
+
+    liq_path = poly_path([(p["t"], p["liq"]) for p in pts])
+    px_path = poly_path([(p["t"], p["px"]) for p in pts])
+
+    # Collateral added or removed: a dashed line. Borrow and Repay: a triangle on the price line,
+    # up for a borrow (re-lever), down for a repay. The opening Borrow: a diamond.
+    flow_svg = mark_svg = ""
+    for a in actions:
+        if not x0 <= a["t"] <= x1:
+            continue
+        x, y = sx(a["t"]), sy(price_at(all_pts, a["t"]))
+        if a["kind"] in ("deposit", "withdraw"):
+            flow_svg += f'<line x1="{x:.1f}" y1="{pad_t}" x2="{x:.1f}" y2="{pad_t + plot_h}" class="chart-mark"/>'
+        elif a["kind"] == "relever":
+            mark_svg += f'<path class="rb-mk relever" d="M{x:.1f},{y - 7:.1f} L{x + 6.5:.1f},{y + 5:.1f} L{x - 6.5:.1f},{y + 5:.1f} Z"/>'
+        elif a["kind"] == "derisk":
+            mark_svg += f'<path class="rb-mk derisk" d="M{x:.1f},{y + 7:.1f} L{x + 6.5:.1f},{y - 5:.1f} L{x - 6.5:.1f},{y - 5:.1f} Z"/>'
+        else:
+            mark_svg += f'<path class="rb-mk open" d="M{x:.1f},{y - 7:.1f} L{x + 7:.1f},{y:.1f} L{x:.1f},{y + 7:.1f} L{x - 7:.1f},{y:.1f} Z"/>'
+
+    last = pts[-1]
+    end_svg = (f'<text x="{sx(last["t"]) + 9:.1f}" y="{sy(last["px"]):.1f}" dominant-baseline="middle" class="chart-endlabel" '
+               f'style="fill:var(--c-line);font-weight:600">${last["px"]:,.0f}</text>')
+    if last["liq"] is not None:
+        end_svg += (f'<text x="{sx(last["t"]) + 9:.1f}" y="{sy(last["liq"]):.1f}" dominant-baseline="middle" class="chart-endlabel" '
+                    f'style="fill:var(--c-liq);font-weight:600">liq. ${last["liq"]:,.0f}</text>')
+
+    svg = f"""
+    <svg viewBox="0 0 {W} {H}" id="rbChart" class="chart-svg" role="img" aria-label="LsETH oracle price in USD since the position opened, against the liquidation price, the no-action corridor and the agent's borrows and repays">
+      <g>{grid}</g>
+      <g>{xticks}</g>
+      {phase_svg}{corridor_svg}{flow_svg}
+      <path d="{liq_path}" fill="none" stroke="var(--c-liq)" stroke-width="1.5" stroke-dasharray="6 4"/>
+      <path d="{px_path}" fill="none" stroke="var(--c-line)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+      {mark_svg}{end_svg}
+      <rect id="rbHover" x="{pad_l}" y="{pad_t}" width="{plot_w}" height="{plot_h}" fill="transparent"/>
+      <line id="rbCrosshair" x1="0" y1="{pad_t}" x2="0" y2="{pad_t + plot_h}" class="chart-crosshair" visibility="hidden"/>
+    </svg>
+    """
+    rebalances = [a for a in actions if a["kind"] in ("relever", "derisk")]
+    relevers = [a for a in rebalances if a["kind"] == "relever"]
+    repays = [a for a in rebalances if a["kind"] == "derisk"]
+    return {
+        "svg": svg,
+        "pts_js": json.dumps([[p["t"], round(p["px"], 1), None if p["liq"] is None else round(p["liq"], 1)] for p in pts],
+                             separators=(",", ":")),
+        "acts_js": json.dumps([[a["t"], a["kind"], round(a.get("usdc") or a.get("lseth"), 2)] for a in actions
+                               if x0 <= a["t"] <= x1], separators=(",", ":")),
+        "scale": {"x0": x0, "x1": x1, "pad_l": pad_l, "plot_w": plot_w, "w": W,
+                  "band_from": band_from, "lo": lo_band, "hi": hi_band},
+        "price": all_pts[-1]["px"], "price_open": all_pts[0]["px"],
+        "n": len(rebalances), "n_relever": len(relevers), "n_repay": len(repays),
+        "usdc_borrowed": sum(a["usdc"] for a in relevers), "usdc_repaid": sum(a["usdc"] for a in repays),
+        "opened": utc(t_open),
+    }
+
+
+rebalance_chart = build_rebalance_chart(load_rebalance_history(), start)
+
 # --- Design system: the BTC board's tokens, fonts, logo and protocol icons ---------------------
 
 tokens_css = re.sub(r"/\*[\s\S]*?\*/", "", (ASSETS / "kpk-tokens.css").read_text())
@@ -642,6 +811,107 @@ if share_chart:
 }})();
 </script>'''
 
+rebalance_card = ""
+if rebalance_chart:
+    rb = rebalance_chart
+    rb_change = (rb["price"] / rb["price_open"] - 1) * 100
+    # The labels are set in capitals by the stylesheet; LsETH keeps its case.
+    keep = '<span class="keep-case">LsETH</span>'
+    rebalance_card = f'''<div class="card">
+    <div class="stat-label">{esc(REBALANCE_CFG["title"]).replace("LsETH", keep)}</div>
+    <div class="statrow">
+      <div><div class="c-label">{keep} oracle price</div><div class="c-value">${rb["price"]:,.0f}</div><div class="c-sub">{sgn(rb_change, 1)}% since the position opened</div></div>
+      <div><div class="c-label">Agent rebalances</div><div class="c-value">{rb["n"]}</div><div class="c-sub">{rb["n_relever"]} re-lever · {rb["n_repay"]} repay, since {rb["opened"].strftime("%-d %b")}</div></div>
+      <div><div class="c-label">Re-lever</div><div class="c-value">{rb["n_relever"]}</div><div class="c-sub">{rb["usdc_borrowed"]:,.0f} USDC borrowed, deposited into the KPK USDC vaults</div></div>
+      <div><div class="c-label">Repay</div><div class="c-value">{rb["n_repay"]}</div><div class="c-sub">{rb["usdc_repaid"]:,.0f} USDC repaid</div></div>
+    </div>
+    <div class="legend">
+      <span><i style="border-top-color:var(--c-line)"></i>LsETH oracle price</span>
+      <span><i class="rb-band-key"></i>no-action corridor</span>
+      <span><i class="dash" style="border-top-color:var(--c-liq)"></i>liquidation price</span>
+      <span><span class="shape" style="color:var(--c-band)">&#9650;</span>re-lever (borrow)</span>
+      <span><span class="shape" style="color:var(--c-liq)">&#9660;</span>repay</span>
+      <span><span class="shape" style="color:var(--kpk-ink)">&#9670;</span>position opened</span>
+      <span><span class="shape">&#9482;</span>LsETH added</span>
+    </div>
+    <div class="chart">
+      {rb["svg"]}
+      <div id="rbTooltip" class="chart-tooltip" role="status">
+        <div class="date" id="rbDate"></div>
+        <div class="row"><span class="key" style="background:var(--c-line)"></span>LsETH oracle price<span class="val" id="rbPx"></span></div>
+        <div class="row" id="rbBandRow"><span class="key" style="background:var(--c-band)"></span>No-action corridor<span class="val" id="rbBand"></span></div>
+        <div class="row" id="rbLiqRow"><span class="key" style="background:var(--c-liq)"></span>Liquidation price<span class="val" id="rbLiq"></span></div>
+        <div id="rbActs"></div>
+      </div>
+    </div>
+    <div class="stat-sub">{T(REBALANCE_CFG["caption"])}</div>
+  </div>'''
+
+rebalance_js = ""
+if rebalance_chart:
+    sc = rebalance_chart["scale"]
+    rebalance_js = f'''<script>
+(function() {{
+  var pts = {rebalance_chart['pts_js']};
+  var acts = {rebalance_chart['acts_js']};
+  var S = {{ x0: {sc['x0']}, x1: {sc['x1']}, padL: {sc['pad_l']}, plotW: {sc['plot_w']}, w: {sc['w']}, bandFrom: {sc['band_from']}, lo: {sc['lo']}, hi: {sc['hi']} }};
+  var svg = document.getElementById('rbChart');
+  var rect = document.getElementById('rbHover');
+  var crosshair = document.getElementById('rbCrosshair');
+  var tooltip = document.getElementById('rbTooltip');
+  if (!svg || !rect) return;
+  var LABELS = {{ relever: 'Re-lever: borrowed', derisk: 'Repay: repaid', open: 'Position opened: borrowed' }};
+
+  function usd(v) {{ return '$' + Math.round(v).toLocaleString('en-US'); }}
+  function num(v, dp) {{ return v.toLocaleString('en-US', {{ maximumFractionDigits: dp }}); }}
+  function nearest(t) {{
+    var best = pts[0];
+    for (var i = 1; i < pts.length; i++) {{
+      if (Math.abs(pts[i][0] - t) < Math.abs(best[0] - t)) best = pts[i];
+    }}
+    return best;
+  }}
+  function show(e) {{
+    var box = svg.getBoundingClientRect();
+    var px = e.clientX - box.left;
+    var frac = Math.max(0, Math.min(1, (px * (S.w / box.width) - S.padL) / S.plotW));
+    var t = S.x0 + frac * (S.x1 - S.x0);
+    var p = nearest(t);
+    var xv = (p[0] - S.x0) / (S.x1 - S.x0) * S.plotW + S.padL;
+    crosshair.setAttribute('x1', xv);
+    crosshair.setAttribute('x2', xv);
+    crosshair.setAttribute('visibility', 'visible');
+    document.getElementById('rbDate').textContent = new Date(p[0] * 1000).toLocaleString('en-GB', {{ day: 'numeric', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit', timeZone: 'UTC' }}) + ' UTC';
+    document.getElementById('rbPx').textContent = usd(p[1]);
+    var hasLiq = p[2] !== null, hasBand = hasLiq && p[0] >= S.bandFrom;
+    document.getElementById('rbLiqRow').style.display = hasLiq ? '' : 'none';
+    document.getElementById('rbBandRow').style.display = hasBand ? '' : 'none';
+    if (hasLiq) document.getElementById('rbLiq').textContent = usd(p[2]);
+    if (hasBand) document.getElementById('rbBand').textContent = usd(p[2] * S.lo) + ' to ' + usd(p[2] * S.hi);
+    var box2 = document.getElementById('rbActs');
+    while (box2.firstChild) box2.removeChild(box2.firstChild);
+    var tol = 7 * (S.x1 - S.x0) / S.plotW;
+    acts.forEach(function(a) {{
+      if (Math.abs(a[0] - p[0]) > tol) return;
+      var row = document.createElement('div');
+      row.className = 'act';
+      var when = new Date(a[0] * 1000).toLocaleString('en-GB', {{ day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit', timeZone: 'UTC' }});
+      row.textContent = when + ' UTC, ' + (a[1] === 'deposit' ? num(a[2], 1) + ' LsETH added' : a[1] === 'withdraw' ? num(a[2], 1) + ' LsETH removed' : LABELS[a[1]] + ' ' + num(a[2], 0) + ' USDC');
+      box2.appendChild(row);
+    }});
+    var cx = xv / S.w * box.width, w = tooltip.offsetWidth || 160;
+    tooltip.style.left = Math.max(w / 2, Math.min(box.width - w / 2, cx)) + 'px';
+    tooltip.style.visibility = 'visible';
+  }}
+  rect.addEventListener('pointermove', show);
+  rect.addEventListener('pointerdown', show);
+  rect.addEventListener('pointerleave', function() {{
+    crosshair.setAttribute('visibility', 'hidden');
+    tooltip.style.visibility = 'hidden';
+  }});
+}})();
+</script>'''
+
 market_url = "https://app.morpho.org/ethereum/market/0xfb7d54e0ce71efc8fffd3f4e1db0afa9265882da5cc76604b62adfac64501e80/lseth-usdc"
 debank_url = f"https://debank.com/profile/{wallet}"
 # The visible stamp keeps the YYYY-MM-DD HH:MM UTC shape: refresh.yml masks
@@ -799,6 +1069,7 @@ def risk_section():
         f'<p class="agent-b">{T(p["body"])}'
         + (f' Detail in the docs: {ext(DOCS["governance"], "Governance and controls ↗")}.' if p.get("docs_link") else "")
         + "</p></div>" for p in RISK["permissions"])
+    rebalance_section = (f'<div class="sub-h">What the agent has done</div>{rebalance_card}' if rebalance_card else "")
     return f"""
 <section id="risk">
   <span class="label">How we manage risk</span>
@@ -811,6 +1082,7 @@ def risk_section():
   <div class="stat-sub" style="margin-top:-6px">Agent settings as set on {esc(RISK['as_of'])}.</div>
   <div class="sub-h">How a signal is handled</div>
   {layers}
+  {rebalance_section}
   <div class="sub-h">The agents</div>
   <div class="grid g3">{agents}</div>
   <div class="sub-h">Onchain permissions</div>
@@ -978,6 +1250,23 @@ details.fold[open] > summary { margin-bottom: 10px; }
 .risk-h { color: var(--kpk-ink-muted); padding-left: 10px; border-left: 2px solid var(--c-band); }
 @media (max-width: 760px) { .risk-row { grid-template-columns: 1fr; gap: 4px; } }
 .chart-mark { stroke: var(--kpk-ink-faint); stroke-width: 1.2; stroke-dasharray: 5 3; }
+.statrow { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-top: 10px; }
+@media (max-width: 760px) { .statrow { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+.c-label { font-size: var(--kpk-text-label); letter-spacing: 0.08em; text-transform: uppercase; color: var(--kpk-ink-muted); font-weight: 500; }
+.c-value { font-size: 26px; font-weight: 500; margin: 4px 0 2px; font-variant-numeric: tabular-nums; }
+.c-sub { font-size: var(--kpk-text-fs-tag); color: var(--kpk-ink-muted); line-height: 1.4; }
+
+.keep-case { text-transform: none; }
+.legend .shape { display: inline-block; margin-right: 6px; font-size: 13px; }
+.legend i.rb-band-key { height: 10px; border: 1px dashed var(--c-band); background: var(--c-band-fill); }
+.rb-band { fill: var(--c-band-fill); stroke: none; }
+.rb-band-edge { fill: none; stroke: var(--c-band); stroke-width: 1; stroke-dasharray: 3 3; }
+.rb-phase { fill: var(--kpk-ink); opacity: 0.05; }
+.rb-mk { stroke: var(--kpk-surface-card); stroke-width: 2; }
+.rb-mk.relever { fill: var(--c-band); }
+.rb-mk.derisk { fill: var(--c-liq); }
+.rb-mk.open { fill: var(--kpk-ink); }
+.chart-tooltip .act { margin-top: 3px; padding-top: 3px; border-top: var(--kpk-rule-soft) solid var(--kpk-line); }
 .chart-svg text.chart-marklabel { font-size: 11px; }
 @media (max-width: 640px) {
   .chart { overflow-x: auto; -webkit-overflow-scrolling: touch; }
@@ -1425,6 +1714,7 @@ page = f"""<!doctype html>
 }})();
 </script>
 {share_js}
+{rebalance_js}
 </body>
 </html>
 """
