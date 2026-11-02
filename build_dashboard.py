@@ -137,9 +137,8 @@ def build_chart(hist, start=None):
         # events exist on the vault. They are single-day jumps in a share-price-
         # derived APY, which a short lookback amplifies. State what is observed.
         label = (
-            f"{clipped_days} days above {y_max:g}% ({span_start} to {span_end}), "
-            f"peak {peak['y']:.0f}%: single-day spikes in the vault APY series, "
-            f"capped for readability"
+            f"Capped at {y_max:g}%: {clipped_days} one-day spikes "
+            f"({span_start} to {span_end}), peak {peak['y']:.0f}%"
         )
         annotation = (
             f'<g class="chart-annot">'
@@ -1259,7 +1258,7 @@ page = f"""<!doctype html>
         <div class="row"><span style="width:10px"></span>Spread<span class="val" id="ttDelta"></span></div>
       </div>
     </div>
-    <div class="stat-sub">Daily borrow rate on the LsETH/USDC market against the net lend rate of both KPK USDC vaults; KPK USDC Yield RWA joined on 27 Aug. The dashed line is KPK USDC Yield's 30-day trend.</div>
+    <div class="stat-sub">Daily borrow rate on the LsETH/USDC market against the net lend rate of both KPK USDC vaults; the fund has lent into KPK USDC Yield RWA since 27 Aug. The dashed line is KPK USDC Yield's 30-day trend.</div>
   </div>
   <div class="card">
     <details class="fold">
