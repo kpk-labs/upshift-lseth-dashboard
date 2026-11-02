@@ -1,7 +1,7 @@
 name: Refresh dashboard
 
 # Rebuilds index.html from live Morpho data and commits it. Needs no secrets:
-# both upstream APIs (Morpho GraphQL, DefiLlama yields) are public and keyless.
+# the upstream APIs (Morpho GraphQL, DefiLlama yields) and the public Ethereum RPCs are keyless.
 on:
   schedule:
     # Every 4 hours at :20 (00:20, 04:20, ... UTC). Rates on this market move
@@ -68,13 +68,16 @@ jobs:
           # switch the schedule off silently.
           last=$(git log -1 --format=%ct -- index.html 2>/dev/null || echo 0)
           age_days=$(( ( $(date -u +%s) - last ) / 86400 ))
+          # Each build also appends a share-price reading to share_price.jsonl, so
+          # in practice this commits on every run, like the BTC board's samples.
           if diff -q <(mask /tmp/prev.html) <(mask index.html) >/dev/null \
+             && git diff --quiet -- share_price.jsonl \
              && [ "$age_days" -lt 6 ]; then
             echo "data unchanged (last commit ${age_days}d ago), not committing"
             git checkout -- index.html
             exit 0
           fi
 
-          git add index.html
+          git add index.html share_price.jsonl
           git commit -m "Refresh $(date -u '+%Y-%m-%d %H:%M UTC')"
           git push

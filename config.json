@@ -40,6 +40,14 @@
     "title": "Running at the {target_ltv} production LTV target since 27 Aug",
     "text": "Stepped up from about 45% at launch and 65% on 10 Aug. The borrowed USDC sits about {live_yield}/{live_rwa} in KPK USDC Yield and KPK USDC Yield RWA, so the vault yield shown is their blend."
   },
+  "share_chart": {
+    "_readme": "Marks on the share-price chart, UTC. Subscriptions and redemptions are marked automatically when the share supply moves by min_flow_pct or more between two readings.",
+    "min_flow_pct": 10,
+    "events": [
+      {"t": "2026-08-10 16:00", "label": "LTV to about 65%"},
+      {"t": "2026-08-27 17:00", "label": "LTV to 75%"}
+    ]
+  },
   "backtest": {
     "summary": "Backtest cross-check: +2.11% a year at 75% LTV over 180 days",
     "text": "Over the 180 days to 30 Jul 2026, on reconstructed onchain borrow rates and the vault's realised share price, this strategy at 75% LTV averaged +2.11% net over LsETH: monthly range 1.32% to 3.17%, with the 1.5% floor cleared on 75% of days. That run used deeper 86%-LLTV proxy markets, because LsETH/USDC had no rate history at the time; its own 45 days since have averaged 4.01% borrow at 89% utilisation, against the proxy's 4.01%."

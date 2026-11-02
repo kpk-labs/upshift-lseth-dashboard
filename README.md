@@ -23,6 +23,7 @@ keyless.
 |---|---|
 | `api.morpho.org/graphql` | market borrow rates, vault net APY, position, share-price history |
 | `yields.llama.fi/pools` | LsETH staking APY (Liquid Collective pool) |
+| public Ethereum RPCs (publicnode, mevblocker, drpc) | one share-price reading per build: the vault's recorded price and the price from KPK's NAV Calculator |
 
 ## Files
 
@@ -31,7 +32,8 @@ keyless.
 | `index.html` | generated output — the published page |
 | `build_dashboard.py` | renders the page; `python3 build_dashboard.py [outfile]` |
 | `config.json` | editable copy, links, contracts and the agent settings the page states (health factor manager, risk section, terms); stamped with the date they were set |
-| `position_tracker.py` | all Morpho queries; `--history`, `--start`, `--peers` for ad-hoc reads |
+| `position_tracker.py` | all Morpho queries and the share-price reading; `--history`, `--start`, `--peers` for ad-hoc reads |
+| `share_price.jsonl` | the share-price series behind the chart: backfilled once from the hourly NAV samples in `karpatkey/curation-dune`, then one reading appended per build and committed by the workflow |
 | `assets/` | KPK fonts and design tokens (`kpk-fonts.css`, `kpk-tokens.css`), KPK logo and protocol icons (`logos/*.webp`), inlined into the output at build time |
 | `robots.txt` | link-reachable, deliberately not search-indexed |
 

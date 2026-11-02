@@ -8,6 +8,7 @@ Editable copy and the agent settings the page states live in config.json.
 import base64
 import html
 import json
+import math
 import re
 import sys
 from datetime import datetime, timezone
@@ -36,6 +37,11 @@ def esc(x):
 
 def utc(ts):
     return datetime.fromtimestamp(ts, tz=timezone.utc)
+
+
+def utc_ts(text):
+    """Epoch seconds for a 'YYYY-MM-DD HH:MM' UTC string."""
+    return int(datetime.strptime(text, "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc).timestamp())
 
 
 def sgn(x, dp=2):
@@ -199,7 +205,7 @@ def build_chart(hist, start=None):
     )
 
     svg = f"""
-    <svg viewBox="0 0 {W} {H}" class="chart-svg" role="img" aria-label="Borrow APY and KPK USDC vault yield APYs, daily, since the position opened">
+    <svg viewBox="0 0 {W} {H}" id="rateChart" class="chart-svg" role="img" aria-label="Borrow APY and KPK USDC vault yield APYs, daily, since the position opened">
       <g>{grid_svg}</g>
       <g>{xtick_svg}</g>
       {annotation}
@@ -266,6 +272,156 @@ def build_chart(hist, start=None):
 
 
 chart = build_chart(hist, start)
+
+
+# --- Share price in LsETH ------------------------------------------------------------------------
+#
+# share_price.jsonl holds one reading per line: t (UTC epoch), b (block), c (share price implied by
+# KPK's NAV Calculator), r (share price the vault has recorded), s (share supply). It was backfilled
+# once from the hourly NAV samples in karpatkey/curation-dune (scripts/upshift_lseth_nav_samples.json,
+# read by archive RPC there). Each build appends one more reading from a public RPC, so CI needs
+# no key; the workflow commits the file.
+SHARES_PATH = HERE / "share_price.jsonl"
+SHARE_CFG = CONFIG["share_chart"]
+HALF_HOUR = 1800
+
+
+def load_share_rows():
+    """The committed readings, oldest first. A bad line is skipped, never fatal."""
+    rows = []
+    if SHARES_PATH.exists():
+        for line in SHARES_PATH.read_text().splitlines():
+            try:
+                rows.append(json.loads(line))
+            except ValueError:
+                continue
+    return sorted(rows, key=lambda r: r["t"])
+
+
+def append_share_reading(rows):
+    """Append one live reading to the file and to rows, unless it is stale, bad or unreachable."""
+    try:
+        reading = pt.fetch_share_price_reading(
+            CONFIG["contracts"]["vault"], CONFIG["contracts"]["shares"], CONFIG["contracts"]["nav_calculator"])
+    except Exception as e:  # a failed read must never fail the build
+        print(f"share price reading skipped: {e}", file=sys.stderr)
+        return
+    if not reading or (rows and (reading["b"] <= rows[-1]["b"] or reading["t"] - rows[-1]["t"] < HALF_HOUR)):
+        return
+    reading = {"t": reading["t"], "b": reading["b"], "c": round(reading["c"], 9),
+               "r": round(reading["r"], 9), "s": round(reading["s"], 6)}
+    with SHARES_PATH.open("a") as f:
+        f.write(json.dumps(reading, separators=(",", ":")) + "\n")
+    rows.append(reading)
+
+
+def build_share_chart(rows, start):
+    """Share price in LsETH since the position opened: the vault's recorded price (a step at each
+    NAV update) against the price implied by KPK's NAV Calculator (continuous)."""
+    t_open = start["timestamp"] if start else 0
+    rows = [r for r in rows if r["t"] >= t_open]
+    if len(rows) < 2:
+        return None
+
+    x0, x1 = rows[0]["t"], rows[-1]["t"]
+    lo = min(min(r["c"], r["r"]) for r in rows)
+    hi = max(max(r["c"], r["r"]) for r in rows)
+    room = max(hi - lo, 1e-5) * 0.12
+    y_lo, y_hi = lo - room, hi + room
+    raw = (y_hi - y_lo) / 5
+    mag = 10 ** math.floor(math.log10(raw))
+    step = next(m * mag for m in (1, 2, 5, 10) if m * mag >= raw)
+    decimals = max(3, math.ceil(-math.log10(step)))
+    tick_vals = [k * step for k in range(math.ceil(y_lo / step), math.floor(y_hi / step) + 1)]
+
+    pad_l, pad_r, pad_t, pad_b = 60, 64, 16, 30
+    W, H = 840, 300
+    plot_w, plot_h = W - pad_l - pad_r, H - pad_t - pad_b
+
+    def sx(t):
+        return pad_l + (t - x0) / (x1 - x0) * plot_w
+
+    def sy(v):
+        return pad_t + (1 - (v - y_lo) / (y_hi - y_lo)) * plot_h
+
+    grid = "\n".join(
+        f'<line x1="{pad_l}" y1="{sy(v):.1f}" x2="{W - pad_r}" y2="{sy(v):.1f}" class="chart-grid"/>'
+        f'<text x="{pad_l - 8}" y="{sy(v):.1f}" class="chart-ytick" text-anchor="end" dominant-baseline="middle">{v:.{decimals}f}</text>'
+        for v in tick_vals)
+    xticks = "\n".join(
+        f'<text x="{sx(x0 + (x1 - x0) * i / 4):.1f}" y="{H - pad_b + 18:.1f}" class="chart-xtick" text-anchor="middle">'
+        f'{utc(x0 + (x1 - x0) * i / 4).strftime("%-d %b")}</text>' for i in range(5))
+
+    # The NAV Calculator line, one point per reading, thinned to one per 6 hours for the page.
+    calc, last_kept = [], None
+    for r in rows:
+        if last_kept is None or r["t"] - last_kept >= 6 * 3600:
+            calc.append([r["t"], r["c"]])
+            last_kept = r["t"]
+    if calc[-1][0] != rows[-1]["t"]:
+        calc.append([rows[-1]["t"], rows[-1]["c"]])
+
+    # The recorded price holds its value until the next NAV update: a staircase.
+    steps = [[rows[0]["t"], rows[0]["r"]]]
+    for r in rows[1:]:
+        if r["r"] != steps[-1][1]:
+            steps.append([r["t"], r["r"]])
+    d = [f"M{sx(steps[0][0]):.1f},{sy(steps[0][1]):.1f}"]
+    for (_, prev), (t, v) in zip(steps, steps[1:]):
+        d.append(f"L{sx(t):.1f},{sy(prev):.1f} L{sx(t):.1f},{sy(v):.1f}")
+    d.append(f"L{sx(x1):.1f},{sy(steps[-1][1]):.1f}")
+    rec_path = " ".join(d)
+    calc_path = " ".join(f"{'M' if i == 0 else 'L'}{sx(t):.1f},{sy(v):.1f}" for i, (t, v) in enumerate(calc))
+
+    # Marks: the dated events from config, plus any subscription or redemption that moved the supply.
+    marks = [(utc_ts(e["t"]), e["label"]) for e in SHARE_CFG["events"]]
+    min_flow = SHARE_CFG["min_flow_pct"] / 100
+    for prev, cur in zip(rows, rows[1:]):
+        if prev["s"] > 0 and abs(cur["s"] / prev["s"] - 1) >= min_flow:
+            amount = abs(cur["s"] - prev["s"]) * cur["c"]
+            marks.append((cur["t"], f"{amount:.0f} LsETH {'subscribed' if cur['s'] > prev['s'] else 'redeemed'}"))
+    mark_svg = ""
+    for t, label in sorted(marks):
+        if x0 <= t <= x1:
+            x = sx(t)
+            mark_svg += (
+                f'<line x1="{x:.1f}" y1="{pad_t}" x2="{x:.1f}" y2="{pad_t + plot_h}" class="chart-mark"/>'
+                f'<text class="chart-marklabel" transform="rotate(-90 {x - 5:.1f} {pad_t + 6})" '
+                f'x="{x - 5:.1f}" y="{pad_t + 6}" text-anchor="end">{esc(label)}</text>')
+
+    # End values: nearly equal, so spread the two labels apart in value order.
+    ends = {"c": sy(rows[-1]["c"]), "r": sy(rows[-1]["r"])}
+    upper, lower = sorted(ends, key=lambda k: ends[k])
+    if ends[lower] - ends[upper] < 15:
+        ends[lower] = ends[upper] + 15
+    end_svg = ""
+    for key, color in (("c", "var(--c-good)"), ("r", "var(--kpk-ink)")):
+        # Coloured by inline style, which beats the grey `.chart-svg text` rule; the two ends are
+        # a few pixels apart, so a dot each would overprint and the colour carries the match.
+        end_svg += (
+            f'<text x="{sx(x1) + 9:.1f}" y="{ends[key]:.1f}" text-anchor="start" dominant-baseline="middle" '
+            f'class="chart-endlabel" style="fill:{color};font-weight:600">{rows[-1][key]:.5f}</text>')
+
+    svg = f"""
+    <svg viewBox="0 0 {W} {H}" id="shareChart" class="chart-svg" role="img" aria-label="Share price in LsETH since the position opened: the vault's recorded price against the price from KPK's NAV Calculator">
+      <g>{grid}</g>
+      <g>{xticks}</g>
+      {mark_svg}
+      <path d="{calc_path}" fill="none" stroke="var(--c-good)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+      <path d="{rec_path}" fill="none" stroke="var(--kpk-ink)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+      {end_svg}
+      <rect id="shareHover" x="{pad_l}" y="{pad_t}" width="{plot_w}" height="{plot_h}" fill="transparent"/>
+      <line id="shareCrosshair" x1="0" y1="{pad_t}" x2="0" y2="{pad_t + plot_h}" class="chart-crosshair" visibility="hidden"/>
+    </svg>
+    """
+    return {"svg": svg, "calc_js": json.dumps([[t, round(v, 7)] for t, v in calc]),
+            "rec_js": json.dumps([[t, round(v, 7)] for t, v in steps]),
+            "scale": {"x0": x0, "x1": x1, "pad_l": pad_l, "plot_w": plot_w}}
+
+
+share_rows = load_share_rows()
+append_share_reading(share_rows)
+share_chart = build_share_chart(share_rows, start)
 
 # --- Design system: the BTC board's tokens, fonts, logo and protocol icons ---------------------
 
@@ -407,6 +563,76 @@ else:
 
 DOCS = CONFIG["docs"]
 CONTRACTS = CONFIG["contracts"]
+
+share_card = ""
+if share_chart:
+    share_card = f'''<div class="card">
+    <div class="stat-label">Share price in LsETH since the position opened</div>
+    <div class="legend">
+      <span><i style="border-top-color:var(--kpk-ink)"></i>Upshift share price (recorded at each NAV update)</span>
+      <span><i style="border-top-color:var(--c-good)"></i>KPK NAV Calculator (live)</span>
+    </div>
+    <div class="chart">
+      {share_chart['svg']}
+      <div id="shareTooltip" class="chart-tooltip" role="status">
+        <div class="date" id="stDate"></div>
+        <div class="row"><span class="key" style="background:var(--c-good)"></span>NAV Calculator<span class="val" id="stCalc"></span></div>
+        <div class="row"><span class="key" style="background:var(--kpk-ink)"></span>Upshift recorded<span class="val" id="stRec"></span></div>
+      </div>
+    </div>
+    <div class="stat-sub">The vault records its share price at each NAV update, twice a week, so the Upshift line moves in steps. KPK's NAV can be read onchain at any block, which gives the continuous line.</div>
+  </div>'''
+
+share_js = ""
+if share_chart:
+    share_js = f'''<script>
+(function() {{
+  var calc = {share_chart['calc_js']};
+  var rec = {share_chart['rec_js']};
+  var scale = {{ x0: {share_chart['scale']['x0']}, x1: {share_chart['scale']['x1']}, padL: {share_chart['scale']['pad_l']}, plotW: {share_chart['scale']['plot_w']} }};
+  var svg = document.getElementById('shareChart');
+  var rect = document.getElementById('shareHover');
+  var crosshair = document.getElementById('shareCrosshair');
+  var tooltip = document.getElementById('shareTooltip');
+  if (!svg || !rect) return;
+
+  function nearest(series, t) {{
+    var best = series[0];
+    for (var i = 1; i < series.length; i++) {{
+      if (Math.abs(series[i][0] - t) < Math.abs(best[0] - t)) best = series[i];
+    }}
+    return best;
+  }}
+  function recordedAt(t) {{
+    var v = rec[0][1];
+    for (var i = 0; i < rec.length && rec[i][0] <= t; i++) v = rec[i][1];
+    return v;
+  }}
+  function show(e) {{
+    var box = svg.getBoundingClientRect();
+    var px = e.clientX - box.left;
+    var frac = Math.max(0, Math.min(1, (px * (840 / box.width) - scale.padL) / scale.plotW));
+    var p = nearest(calc, scale.x0 + frac * (scale.x1 - scale.x0));
+    var xv = (p[0] - scale.x0) / (scale.x1 - scale.x0) * scale.plotW + scale.padL;
+    crosshair.setAttribute('x1', xv);
+    crosshair.setAttribute('x2', xv);
+    crosshair.setAttribute('visibility', 'visible');
+    document.getElementById('stDate').textContent = new Date(p[0] * 1000).toLocaleString('en-GB', {{ day: 'numeric', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit', timeZone: 'UTC' }}) + ' UTC';
+    document.getElementById('stCalc').textContent = p[1].toFixed(6);
+    document.getElementById('stRec').textContent = recordedAt(p[0]).toFixed(6);
+    var cx = xv / 840 * box.width, w = tooltip.offsetWidth || 160;
+    tooltip.style.left = Math.max(w / 2, Math.min(box.width - w / 2, cx)) + 'px';
+    tooltip.style.visibility = 'visible';
+  }}
+  rect.addEventListener('pointermove', show);
+  rect.addEventListener('pointerdown', show);
+  rect.addEventListener('pointerleave', function() {{
+    crosshair.setAttribute('visibility', 'hidden');
+    tooltip.style.visibility = 'hidden';
+  }});
+}})();
+</script>'''
+
 market_url = "https://app.morpho.org/ethereum/market/0xfb7d54e0ce71efc8fffd3f4e1db0afa9265882da5cc76604b62adfac64501e80/lseth-usdc"
 debank_url = f"https://debank.com/profile/{wallet}"
 # The visible stamp keeps the YYYY-MM-DD HH:MM UTC shape: refresh.yml masks
@@ -734,6 +960,8 @@ details.fold[open] > summary { margin-bottom: 10px; }
 .chart-endlabel { font-size: 12px; font-weight: 500; }
 .chart-crosshair { stroke: var(--kpk-ink-muted); stroke-width: 1; }
 .chart-annot text { font-size: 11px; }
+.chart-mark { stroke: var(--kpk-ink-faint); stroke-width: 1.2; stroke-dasharray: 5 3; }
+.chart-svg text.chart-marklabel { font-size: 11px; }
 @media (max-width: 640px) {
   .chart { overflow-x: auto; -webkit-overflow-scrolling: touch; }
   .chart-svg { min-width: 720px; }
@@ -1007,6 +1235,7 @@ page = f"""<!doctype html>
     </div>
   </div>
   <div class="stat-sub">{esc(position_age_note)} KPK curates both sides of the LsETH/USDC market, and holds the borrow rate competitive with comparable 86%-LLTV USDC markets such as wstETH/USDC and rETH/USDC. LsETH is marked at {money(lseth_price)} by the market's oracle; vault yields are net of the vaults' fees. Verify the collateral and borrow legs on {ext(debank_url, 'DeBank ↗')}, which shows both positions but not the underlying yield.</div>
+  {share_card}
   <div class="card">
     <div class="stat-label">Borrow rate and vault yields since the position opened</div>
     {legend}
@@ -1104,7 +1333,7 @@ page = f"""<!doctype html>
   var yieldp = {chart['yield_js']};
   var rwap = {chart['rwa_js']};
   var scale = {{ x0: {chart['scale']['x0']}, x1: {chart['scale']['x1']}, padL: {chart['scale']['pad_l']}, plotW: {chart['scale']['plot_w']} }};
-  var svg = document.querySelector('.chart-svg');
+  var svg = document.getElementById('rateChart');
   var rect = document.getElementById('hoverRect');
   var crosshair = document.getElementById('crosshair');
   var tooltip = document.getElementById('chartTooltip');
@@ -1168,6 +1397,7 @@ page = f"""<!doctype html>
   }}
 }})();
 </script>
+{share_js}
 </body>
 </html>
 """
