@@ -64,7 +64,7 @@
   "risk": {
     "as_of": "2 Nov 2026",
     "title": "Automated in a band, alerted on carry, bounded onchain",
-    "lede": "KPK runs the position with deterministic agents. They act only through onchain permissions and within the settings KPK gives them: when a predefined condition is met, they execute a predefined action. The health factor manager keeps the loan in its band; the other agents move LsETH between the vault and the trading subaccount and propose the NAV. A negative carry goes to KPK's risk team for review.",
+    "lede": "KPK runs the position with deterministic agents. They act only through onchain permissions and within the settings KPK gives them: when a predefined condition is met, they execute a predefined action. The health factor manager keeps the loan in its band; the other agents move LsETH between the vault and the trading subaccount and propose the NAV. Two exit agents, one per KPK USDC vault, withdraw the fund's USDC from a vault back to the trading subaccount when Hypernative flags that vault or a market it lends into. A negative carry goes to KPK's risk team for review.",
     "steps": [
       ["Watch", "The agents read the position's health factor and the LsETH waiting in the vault. Hypernative watches the carry: the two vaults' yield against the LsETH/USDC borrow rate."],
       ["Trigger", "Rules set in advance. Inside the health factor band, {repay_below} to {borrow_above}, nothing happens. Outside it, the health factor manager acts. A negative spread raises an alert to KPK's risk team."],
@@ -105,8 +105,12 @@
         "title": "The carry and the KPK USDC vaults",
         "icon": "morpho",
         "sub": "Watched by Hypernative and by the vaults' own agents",
-        "items": ["the two vaults' share-price yield", "the LsETH/USDC borrow rate", "the spread, as a 6-hour median"],
+        "items": ["the two vaults' share-price yield", "the LsETH/USDC borrow rate", "the spread, as a 6-hour median", "vault and market alerts"],
         "lists": [
+          {"title": "Triggers an automated action, no human approval needed", "items": [
+            "an exploit-class, pause or oracle alert on a market a KPK USDC vault lends into: that vault's exit agent withdraws the fund's USDC to the trading subaccount",
+            "a vault-level alert (a gate change, an owner or curator change, or a share-price drop): the same agent withdraws the fund's USDC"
+          ]},
           {"title": "Alerts KPK's risk team for review", "items": [
             "the spread turns negative"
           ]},
@@ -119,8 +123,8 @@
     "layers": {
       "auto": {
         "tag": "Layer 1 · automated",
-        "title": "The health factor manager, inside its band",
-        "body": "Below a health factor of {repay_below} the agent repays to {repay_to}; above {borrow_above} it borrows back to {borrow_to} and deposits the new USDC {split_yield}/{split_rwa} into the two KPK USDC vaults, in steps of at least {min_change} USDC. At the market's {lltv} LLTV those levels are {repay_below_ltv}, {repay_to_ltv}, {borrow_to_ltv} and {borrow_above_ltv} LTV."
+        "title": "The health factor manager and the exit agents",
+        "body": "Below a health factor of {repay_below} the agent repays to {repay_to}; above {borrow_above} it borrows back to {borrow_to} and deposits the new USDC {split_yield}/{split_rwa} into the two KPK USDC vaults, in steps of at least {min_change} USDC. At the market's {lltv} LLTV those levels are {repay_below_ltv}, {repay_to_ltv}, {borrow_to_ltv} and {borrow_above_ltv} LTV. The exit agents act in this layer too: on an exploit-class, pause or oracle alert on a market a KPK USDC vault lends into, or a vault-level alert (a gate change, an owner or curator change, or a share-price drop), the vault's exit agent withdraws the fund's USDC from that vault back to the trading subaccount."
       },
       "human": {
         "tag": "Layer 2 · human-reviewed",
@@ -134,7 +138,8 @@
       {"name": "Deposit agents", "short": "put new LsETH to work", "body": "Move newly subscribed LsETH from the Upshift vault to the trading subaccount, and supply idle LsETH there as collateral on Morpho."},
       {"name": "Withdraw agent", "short": "funds redemptions", "body": "Moves LsETH back from the trading subaccount to the vault to pay redemptions."},
       {"name": "NAV agent", "short": "proposes the NAV twice a week", "body": "KPK's NAV Calculator gives the fund's NAV at every block, and anyone can query it onchain. The Upshift vault records it twice a week: the NAV agent checks it against an independent valuation and proposes the update on Mondays and Thursdays. Upshift co-signs each update, bounded by a maximum change set by the vault owner.", "link": "nav_calculator"},
-      {"name": "Agents on the KPK USDC vaults", "short": "rebalance, exit, monitoring", "body": "Both KPK USDC vaults run KPK's rebalance, exit and monitoring agents, which exit a market on a pause, exploit or oracle change. They act on the vaults, not on the fund's own loan."}
+      {"name": "Agents on the KPK USDC vaults", "short": "rebalance, exit, monitoring", "body": "Both KPK USDC vaults run KPK's rebalance, exit and monitoring agents, which exit a market on a pause, exploit or oracle change. They act on the vaults, not on the fund's own loan."},
+      {"name": "Exit agents", "short": "pull USDC out of a vault on an alert", "body": "One per KPK USDC vault, each acting with no human approval needed. On an exploit-class, pause or oracle alert on a market the vault lends into, or a vault-level alert (a gate change, an owner or curator change, or a share-price drop), it withdraws the fund's USDC from that vault back to the trading subaccount."}
     ],
     "permissions": [
       {"icon": "users", "title": "Two parties own the vault", "body": "The vault owner is a 3-of-4 Safe with two KPK seats, the KPK curation Safe and the KPK Security Council, and two Upshift seats, so neither side can change the vault alone."},
