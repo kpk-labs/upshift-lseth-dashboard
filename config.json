@@ -23,13 +23,14 @@
   ],
   "intro": [
     "The KPK LsETH Carry Fund earns a carry on Liquid Collective's LsETH, on top of its ETH staking yield, through collateralised lending on Morpho. LsETH is supplied as collateral on the Morpho LsETH/USDC market, USDC is borrowed against it within a managed health factor band, and the proceeds are deployed into two KPK-curated USDC vaults on Morpho. Holders stay fully exposed to ETH and earn ETH staking yield plus the spread between stablecoin lending yields and borrow costs, with returns accruing in LsETH.",
+    "LsETH is Liquid Collective's liquid staking token for ETH. Approved platforms such as Figment and Kraken mint and redeem it, and it also trades on DEXes, where it can be bought and sold without KYC.",
     "Deposits and redemptions are in LsETH. The fund runs on Upshift's vault infrastructure with KPK as curator, and KPK's agents adjust the loan around the clock as ETH moves."
   ],
   "scope": {
     "_readme": "Cards under the intro, so a reader can scope the fund. One borrow venue, so no alternative cards.",
     "cards": [
       {"label": "Chain", "value": "Ethereum mainnet only", "detail": "The vault, the position and both KPK USDC vaults are on Ethereum.", "icon": "ethereum"},
-      {"label": "Collateral and borrow", "value": "Morpho LsETH/USDC", "detail": "LsETH as collateral, USDC borrowed against it, at a {lltv} LLTV. KPK curates both sides of the market.", "icon": "morpho"},
+      {"label": "Collateral and borrow", "value": "Morpho LsETH/USDC", "detail": "LsETH as collateral, USDC borrowed against it. KPK curates both sides of the market.", "icon": "morpho"},
       {"label": "Liquid sleeve", "value": "Morpho", "detail": "KPK USDC Yield and KPK USDC Yield RWA, both curated by KPK, {split_yield}/{split_rwa} target.", "icon": "morpho"},
       {"label": "Fund infrastructure", "value": "Upshift", "detail": "The vault, shares token and trading subaccount are Upshift's. KPK's onchain NAV calculator values the position.", "icon": "upshift"}
     ]
@@ -37,7 +38,7 @@
   "status_note": {
     "_readme": "Shown under the headline carry. Clear 'text' to hide it.",
     "title": "Running at the {target_ltv} production LTV target since 27 Aug",
-    "text": "The ramp is complete: about 45% at launch, about 65% from 10 Aug, and the {target_ltv} production target since 27 Aug, each step gated on the agents building a live track record at the previous level. The health factor manager holds the position there, borrowing when the health factor rises above its band and repaying when it falls below. The borrowed USDC is split across two KPK vaults, KPK USDC Yield and KPK USDC Yield RWA (about {live_yield}/{live_rwa} today), so the vault yield shown is the blend of where the money sits. Position size is a deliberately small pilot: the carry is a percentage, so it is the same at this size or at scale."
+    "text": "Stepped up from about 45% at launch and 65% on 10 Aug. The borrowed USDC sits about {live_yield}/{live_rwa} in KPK USDC Yield and KPK USDC Yield RWA, so the vault yield shown is their blend."
   },
   "backtest": {
     "summary": "Backtest cross-check: +2.11% a year at 75% LTV over 180 days",

@@ -481,7 +481,7 @@ def mini(label, value, sub):
 
 
 if lseth_apy is not None:
-    total_row = mini("Total APY on LsETH", f'<span id="totalApy">{lseth_apy + carry_head:.2f}%</span>',
+    total_row = mini("Total APY on ETH", f'<span id="totalApy">{lseth_apy + carry_head:.2f}%</span>',
                      f'{lseth_apy:.2f}% staking + <span id="carryPart">{carry_head:.2f}</span>% carry')
 else:
     # The staking leg comes from DefiLlama (Morpho serves null for it); if that
