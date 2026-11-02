@@ -1,0 +1,150 @@
+{
+  "_readme": "Editable copy for the public page. Change wording and settings here, not in build_dashboard.py. Text may use these placeholders, filled at build time: {repay_below} {repay_to} {borrow_above} {borrow_to} (health factors from health_factor_manager), the same names ending _ltv (that health factor as LTV at the market's live LLTV), {min_change} (USDC), {split_yield} {split_rwa} (target split, %), {lltv} (live LLTV), {target_ltv}, {live_yield} {live_rwa} (today's split, %). Bump risk.as_of whenever a setting changes.",
+  "app_url": "https://app.kpk.io/vaults/upshift-lseth-mainnet",
+  "live_since": "4 Aug 2026",
+  "performance_fee": 0.1,
+  "target_ltv": 75,
+  "docs": {
+    "fund": "https://docs.kpk.io/funds/funds/lseth-carry",
+    "governance": "https://docs.kpk.io/funds/funds/lseth-carry#governance-and-controls",
+    "automation": "https://docs.kpk.io/vaults/infrastructure/automation",
+    "risk_framework": "https://docs.kpk.io/vaults/infrastructure/risk-framework",
+    "dune": "https://dune.com/kpk/upshift-kpk-lseth",
+    "backtest_query": "https://dune.com/queries/8163239"
+  },
+  "contracts": {
+    "_readme": "From the fund docs (Key information). The trading subaccount is read from position_tracker.DEFAULT_WALLET.",
+    "vault": "0x00E95754322D15aB8765961c6Ac5682B9282F54F",
+    "shares": "0x2eC25d8Bf3aB320b71B7b4D27C9F7d6d72Fb6f62",
+    "nav_calculator": "0x54EaD2A1dB7456cA917675Ea8908ec8A997c6214"
+  },
+  "deposit_assets": [
+    {"asset": "LsETH", "icon": "lseth", "status": "live"}
+  ],
+  "intro": [
+    "The KPK LsETH Carry Fund earns a carry on Liquid Collective's LsETH, on top of its ETH staking yield, through collateralised lending on Morpho. LsETH is supplied as collateral on the Morpho LsETH/USDC market, USDC is borrowed against it within a managed health factor band, and the proceeds are deployed into two KPK-curated USDC vaults on Morpho. Holders stay fully exposed to ETH and earn ETH staking yield plus the spread between stablecoin lending yields and borrow costs, with returns accruing in LsETH.",
+    "Deposits and redemptions are in LsETH. The fund runs on Upshift's vault infrastructure with KPK as curator, and KPK's agents adjust the loan around the clock as ETH moves."
+  ],
+  "scope": {
+    "_readme": "Cards under the intro, so a reader can scope the fund. One borrow venue, so no alternative cards.",
+    "cards": [
+      {"label": "Chain", "value": "Ethereum mainnet only", "detail": "The vault, the position and both KPK USDC vaults are on Ethereum.", "icon": "ethereum"},
+      {"label": "Collateral and borrow", "value": "Morpho LsETH/USDC", "detail": "LsETH as collateral, USDC borrowed against it, at a {lltv} LLTV. KPK curates both sides of the market.", "icon": "morpho"},
+      {"label": "Liquid sleeve", "value": "Morpho", "detail": "KPK USDC Yield and KPK USDC Yield RWA, both curated by KPK, {split_yield}/{split_rwa} target.", "icon": "morpho"},
+      {"label": "Fund infrastructure", "value": "Upshift", "detail": "The vault, shares token and trading subaccount are Upshift's. KPK's onchain NAV calculator values the position.", "icon": "upshift"}
+    ]
+  },
+  "status_note": {
+    "_readme": "Shown under the headline carry. Clear 'text' to hide it.",
+    "title": "Running at the {target_ltv} production LTV target since 27 Aug",
+    "text": "The ramp is complete: about 45% at launch, about 65% from 10 Aug, and the {target_ltv} production target since 27 Aug, each step gated on the agents building a live track record at the previous level. The health factor manager holds the position there, borrowing when the health factor rises above its band and repaying when it falls below. The borrowed USDC is split across two KPK vaults, KPK USDC Yield and KPK USDC Yield RWA (about {live_yield}/{live_rwa} today), so the vault yield shown is the blend of where the money sits. Position size is a deliberately small pilot: the carry is a percentage, so it is the same at this size or at scale."
+  },
+  "backtest": {
+    "summary": "Backtest cross-check: +2.11% a year at 75% LTV over 180 days",
+    "text": "Over the 180 days to 30 Jul 2026, on reconstructed onchain borrow rates and the vault's realised share price, this strategy at 75% LTV averaged +2.11% net over LsETH: monthly range 1.32% to 3.17%, with the 1.5% floor cleared on 75% of days. That run used deeper 86%-LLTV proxy markets, because LsETH/USDC had no rate history at the time; its own 45 days since have averaged 4.01% borrow at 89% utilisation, against the proxy's 4.01%."
+  },
+  "health_factor_manager": {
+    "_readme": "Live KPK Agents config for this position. The page converts each health factor to LTV at the market's live LLTV.",
+    "repay_below": 1.1025,
+    "repay_to": 1.1467,
+    "borrow_above": 1.24,
+    "borrow_to": 1.1927,
+    "min_change_usdc": 1000,
+    "split": {"yield": 60, "rwa": 40}
+  },
+  "risk": {
+    "as_of": "2 Nov 2026",
+    "title": "Automated in a band, alerted on carry, bounded onchain",
+    "lede": "KPK runs the position with deterministic agents. They act only through onchain permissions and within the settings KPK gives them: when a predefined condition is met, they execute a predefined action. The health factor manager keeps the loan in its band; the other agents move LsETH between the vault and the trading subaccount and propose the NAV. The fund's own position has no automated exit: a negative carry alerts KPK's risk team and triggers no automated action.",
+    "steps": [
+      ["Watch", "The agents read the position's health factor and the LsETH waiting in the vault. Hypernative watches the carry: the two vaults' yield against the LsETH/USDC borrow rate."],
+      ["Trigger", "Rules set in advance. Inside the health factor band, {repay_below} to {borrow_above}, nothing happens. Outside it, the health factor manager acts. A negative spread raises an alert, not a transaction."],
+      ["Act", "The agent sends the transaction itself: it repays to a health factor of {repay_to}, or borrows back to {borrow_to}, in steps of at least {min_change} USDC."],
+      ["Bounded", "On the operator Safe, KPK's agents can call only the two LsETH transfer functions, through a Zodiac Roles module. NAV updates need KPK's and Upshift's signatures and stay within the vault owner's maximum change."]
+    ],
+    "watch": [
+      {
+        "title": "The fund's position",
+        "icon": "morpho",
+        "sub": "Read by the health factor manager",
+        "items": ["LsETH collateral", "USDC debt", "health factor"],
+        "lists": [
+          {"title": "Triggers an automated action, no human approval needed", "items": [
+            "health factor below {repay_below} ({repay_below_ltv} LTV): repays USDC until it is back at {repay_to} ({repay_to_ltv})",
+            "health factor above {borrow_above} ({borrow_above_ltv} LTV): borrows back to {borrow_to} ({borrow_to_ltv}) and deposits the USDC {split_yield}/{split_rwa} into KPK USDC Yield and KPK USDC Yield RWA",
+            "a change smaller than {min_change} USDC is not made"
+          ]}
+        ]
+      },
+      {
+        "title": "Subscriptions, redemptions and NAV",
+        "icon": "upshift",
+        "sub": "Handled by the deposit, withdraw and NAV agents",
+        "items": ["new LsETH in the Upshift vault", "idle LsETH in the trading subaccount", "redemptions to pay", "NAV against an independent valuation"],
+        "lists": [
+          {"title": "Triggers an automated action, no human approval needed", "items": [
+            "newly subscribed LsETH: moved from the Upshift vault to the trading subaccount",
+            "idle LsETH in the subaccount: supplied as collateral on Morpho",
+            "redemptions: LsETH moved back from the subaccount to the vault to pay them"
+          ]},
+          {"title": "Needs KPK's and Upshift's signatures", "items": [
+            "a NAV update, proposed by the NAV agent on Mondays and Thursdays and bounded by a maximum change set by the vault owner"
+          ]}
+        ]
+      },
+      {
+        "title": "The carry and the KPK USDC vaults",
+        "icon": "morpho",
+        "sub": "Watched by Hypernative and by the vaults' own agents",
+        "items": ["the two vaults' share-price yield", "the LsETH/USDC borrow rate", "the spread, as a 6-hour median"],
+        "lists": [
+          {"title": "Alerts KPK's risk team, no automated action", "items": [
+            "the spread turns negative"
+          ]},
+          {"title": "Automated on the KPK USDC vaults", "items": [
+            "a pause, exploit or oracle change in a market a vault lends into: the vault's agents exit that market"
+          ]}
+        ]
+      }
+    ],
+    "layers": {
+      "auto": {
+        "tag": "Layer 1 · automated",
+        "title": "The health factor manager, inside its band",
+        "body": "Below a health factor of {repay_below} the agent repays to {repay_to}; above {borrow_above} it borrows back to {borrow_to} and deposits the new USDC {split_yield}/{split_rwa} into the two KPK USDC vaults, in steps of at least {min_change} USDC. At the market's {lltv} LLTV those levels are {repay_below_ltv}, {repay_to_ltv}, {borrow_to_ltv} and {borrow_above_ltv} LTV."
+      },
+      "human": {
+        "tag": "Layer 2 · human-reviewed",
+        "title": "Negative carry goes to the risk team",
+        "body": "Hypernative watches the spread, the two vaults' share-price yield minus the LsETH/USDC borrow rate as a 6-hour median, and alerts KPK's risk team when it turns negative. The alert triggers no automated action. The fund's own position has no automated exit.",
+        "chips": ["Hypernative"]
+      }
+    },
+    "agents": [
+      {"name": "Health factor manager", "short": "keeps the health factor around 1.15", "body": "Keeps the position inside its band. Below a health factor of {repay_below} it repays to {repay_to}; above {borrow_above} it borrows back to {borrow_to}. Each change is at least {min_change} USDC, and new borrowing goes {split_yield}/{split_rwa} into KPK USDC Yield and KPK USDC Yield RWA."},
+      {"name": "Deposit agents", "short": "put new LsETH to work", "body": "Move newly subscribed LsETH from the Upshift vault to the trading subaccount, and supply idle LsETH there as collateral on Morpho."},
+      {"name": "Withdraw agent", "short": "funds redemptions", "body": "Moves LsETH back from the trading subaccount to the vault to pay redemptions."},
+      {"name": "NAV agent", "short": "proposes the NAV twice a week", "body": "Values the position with KPK's onchain NAV Calculator and checks it against an independent valuation, then proposes a NAV update on Mondays and Thursdays. Upshift co-signs each update, and each is bounded by a maximum change set by the vault owner.", "link": "nav_calculator"},
+      {"name": "Agents on the KPK USDC vaults", "short": "rebalance, exit, monitoring", "body": "Both KPK USDC vaults run KPK's rebalance, exit and monitoring agents, which exit a market on a pause, exploit or oracle change. They act on the vaults, not on the fund's own loan."}
+    ],
+    "permissions": [
+      {"icon": "users", "title": "Two parties own the vault", "body": "The vault owner is a 3-of-4 Safe with two KPK seats, the KPK curation Safe and the KPK Security Council, and two Upshift seats, so neither side can change the vault alone."},
+      {"icon": "shield", "title": "Only the operator moves LsETH", "body": "Moving LsETH between the vault and the trading subaccount, and writing the NAV, are reserved to the operator, a 2-of-2 Safe with one KPK and one Upshift signer. KPK's agents call only the two transfer functions, through a Zodiac Roles module on that Safe."},
+      {"icon": "sign", "title": "Both sides sign every NAV", "body": "Each NAV update needs both signatures and is bounded by a maximum change set by the vault owner.", "docs_link": true}
+    ]
+  },
+  "terms": {
+    "tiles": [
+      {"value": "Instant", "detail": "subscriptions, up to the vault's 10,000 LsETH cap"},
+      {"value": "Instant to 2 days", "detail": "redemptions: instant against LsETH held in the vault; larger amounts once KPK moves LsETH back from the trading subaccount, normally within 2 days", "strong": true}
+    ],
+    "note": "Subscribe in LsETH and redeem for LsETH, both at the last recorded share price. Subscribed LsETH is then moved to the trading subaccount and supplied as collateral.",
+    "rows": [
+      ["Deposit and redemption asset", "LsETH"],
+      ["Vault cap", "10,000 LsETH"],
+      ["Subscription and redemption fees", "none"],
+      ["Performance fee", "10% of carry, already deducted above"],
+      ["NAV updates", "Mondays and Thursdays"]
+    ]
+  }
+}

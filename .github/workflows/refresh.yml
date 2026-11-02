@@ -41,8 +41,9 @@ jobs:
       - name: Sanity-check the output
         run: |
           bytes=$(stat -c %s index.html)
-          if [ "$bytes" -lt 300000 ]; then
-            echo "index.html only ${bytes}B (expected >300KB)" >&2
+          # ~200KB with the KPK fonts inlined; a page without them is ~135KB.
+          if [ "$bytes" -lt 150000 ]; then
+            echo "index.html only ${bytes}B (expected >150KB)" >&2
             exit 1
           fi
           grep -q 'id="ltvSlider"' index.html || { echo "LTV slider missing" >&2; exit 1; }

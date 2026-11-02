@@ -1,9 +1,10 @@
-# Upshift lsETH carry dashboard
+# LsETH Carry Fund page
 
-Static, self-contained dashboard for the Upshift lsETH carry position: lsETH
-supplied as collateral on Morpho, USDC borrowed against it, that USDC redeployed
-into KPK USDC Morpho vaults. Shows the borrow/lend spread, the carry it produces
-per 1 lsETH at a chosen LTV, and the full rate history.
+Static, self-contained page for KPK's LsETH Carry Fund (on Upshift): LsETH
+supplied as collateral on Morpho, USDC borrowed against it, that USDC deployed
+into the KPK USDC Morpho vaults. Shows the carry and its formula, the position,
+the full rate history, a carry simulator, how KPK manages risk, and the terms.
+Layout and design system follow KPK's BTC Carry Fund board.
 
 **Live page:** https://external.kpk.io/upshift-lseth-dashboard/ (copied from this repo every 4 hours by kpk-labs/external-resources)
 
@@ -21,7 +22,7 @@ keyless.
 | Source | Used for |
 |---|---|
 | `api.morpho.org/graphql` | market borrow rates, vault net APY, position, share-price history |
-| `yields.llama.fi/pools` | lsETH staking APY (Liquid Collective pool) |
+| `yields.llama.fi/pools` | LsETH staking APY (Liquid Collective pool) |
 
 ## Files
 
@@ -29,8 +30,9 @@ keyless.
 |---|---|
 | `index.html` | generated output — the published page |
 | `build_dashboard.py` | renders the page; `python3 build_dashboard.py [outfile]` |
+| `config.json` | editable copy, links, contracts and the agent settings the page states (health factor manager, risk section, terms); stamped with the date they were set |
 | `position_tracker.py` | all Morpho queries; `--history`, `--start`, `--peers` for ad-hoc reads |
-| `assets/` | Lexend weights + KPK wordmark, inlined into the output at build time |
+| `assets/` | KPK fonts and design tokens (`kpk-fonts.css`, `kpk-tokens.css`), KPK logo and protocol icons (`logos/*.webp`), inlined into the output at build time |
 | `robots.txt` | link-reachable, deliberately not search-indexed |
 
 Stdlib only — no `pip install` needed. All assets are inlined, so the published
@@ -38,12 +40,12 @@ page makes no external requests at view time.
 
 ## Reading the page
 
-- **Carry** is what 1 lsETH earns *in addition to* its own staking yield, net of
+- **Carry** is what 1 LsETH earns *in addition to* its own staking yield, net of
   the 10% performance fee. Add it to the staking APY for the total.
 - **Spread basis** — "Live" is the forward-looking view; the trailing averages are
   a reality check, each pairing the vault's realized net APY with the borrow rate
   over the same window.
-- The **LTV slider** is a projection at a fixed spread. Today's LTV is deliberately
-  conservative while the automations are finetuned, so read it as a floor.
+- The **LTV slider** is a projection at a fixed spread. Its shaded segment is the
+  health factor manager's band from `config.json`, shown as LTV at the market's LLTV.
 - The header's "As of" timestamp is when the data was read. The page does not
   refresh itself in the browser.
