@@ -405,9 +405,11 @@ def fetch_rebalance_history(wallet: str = DEFAULT_WALLET) -> dict:
     })["marketPosition"]
     lltv = int(pos["market"]["lltv"]) / 1e18
     hs = pos["historicalState"]
-    coll = {p["x"]: int(p["y"]) / 1e18 for p in hs["collateral"]}
-    value = {p["x"]: int(p["y"]) / 1e6 for p in hs["collateralValue"]}
-    debt = {p["x"]: int(p["y"]) / 1e6 for p in hs["borrowAssets"]}
+    # The newest hour can come back null before Morpho indexes it; skip nulls
+    # rather than drop the whole chart. The join below needs all three anyway.
+    coll = {p["x"]: int(p["y"]) / 1e18 for p in hs["collateral"] if p["y"] is not None}
+    value = {p["x"]: int(p["y"]) / 1e6 for p in hs["collateralValue"] if p["y"] is not None}
+    debt = {p["x"]: int(p["y"]) / 1e6 for p in hs["borrowAssets"] if p["y"] is not None}
     points = []
     for t in sorted(coll):
         if coll[t] <= 0 or t not in value or t not in debt:
