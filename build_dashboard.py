@@ -685,13 +685,13 @@ spread_buttons = "".join(
     for k, b in bases.items())
 
 
-def mini(label, value, sub):
-    return f'<div class="mini"><span class="m-label">{label}<em>{sub}</em></span><span class="m-value">{value}</span></div>'
+def mini(label, value, sub, cls=""):
+    return f'<div class="mini{(' ' + cls) if cls else ''}"><span class="m-label">{label}<em>{sub}</em></span><span class="m-value">{value}</span></div>'
 
 
 if lseth_apy is not None:
     total_row = mini("Total APY on ETH", f'<span id="totalApy">{lseth_apy + carry_head:.2f}%</span>',
-                     f'{lseth_apy:.2f}% staking + <span id="carryPart">{carry_head:.2f}</span>% carry')
+                     f'{lseth_apy:.2f}% staking + <span id="carryPart">{carry_head:.2f}</span>% carry', cls="pop")
 else:
     # The staking leg comes from DefiLlama (Morpho serves null for it); if that
     # fetch failed, show LLTV rather than invent a staking rate.
@@ -954,6 +954,8 @@ details.agent[open] > summary::after { content: "Show less"; }
 .side-stats { display: flex; flex-direction: column; background: var(--kpk-surface-card); border: var(--kpk-rule-hard) solid var(--kpk-line); border-radius: var(--kpk-radius-card); padding: 4px 18px; }
 .mini { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; padding: 8px 0; }
 .mini + .mini { border-top: var(--kpk-rule-soft) solid var(--kpk-line); }
+/* The fund's headline return: KPK terracotta-600, the same token as the chart's Yield line. */
+.mini.pop .m-value { color: var(--c-yield); }
 .m-label { font-size: var(--kpk-text-body-small); color: var(--kpk-ink-muted); font-weight: 500; }
 .m-label em { display: block; font-style: normal; font-weight: 400; font-size: var(--kpk-text-fs-tag); margin-top: 2px; }
 .m-value { font-size: 20px; font-weight: 500; font-variant-numeric: tabular-nums; white-space: nowrap; }
@@ -1287,13 +1289,13 @@ page = f"""<!doctype html>
   <div class="card">
     <div class="sim-head">
       <div><h2>Carry per 1 LsETH at a chosen LTV</h2>
-      <p class="lede">Carry = spread × LTV × {fee_term}. The position is managed by health factor, which sets LTV ({V['lltv']} LLTV ÷ health factor); the shaded segment is the health factor manager's band. Scales linearly: 1 LsETH or 10,000 LsETH earns the same percentage. Pick a spread, then drag the handle or click a marker.</p></div>
+      <p class="lede">Carry = spread × LTV × {fee_term}. The health factor sets LTV ({V['lltv']} LLTV ÷ health factor); the shaded segment is the health factor manager's band.</p></div>
       <div class="sim-out"><span class="big" id="sliderCarry">{sgn(carry_head)}%</span><span class="muted">a year on LsETH<br>at <b id="sliderLtv">{ltv:.1f}%</b> LTV, <span id="spreadBasis">{esc(B0['label'])}</span> spread, after fee</span></div>
     </div>
     <div class="spread-picker" role="group" aria-label="Which spread to simulate with">
       <span class="picker-label">Spread</span>
       {spread_buttons}
-      <span class="picker-note"><b>Live</b> is the forward-looking basis. The trailing options are a reality check on it, each pairing the vaults' realised net APY with the borrow rate over the same window. The headline above follows the same choice.</span>
+      <span class="picker-note"><b>Live</b> is today's borrow rate against the vaults' current yield. The trailing options pair the vaults' realised yield with the borrow rate over the same window, as a check.</span>
     </div>
     <div class="slider-wrap">
       <div class="ends"><span>0% LTV, no carry</span><span class="hi">liquidation at {lltv:.0f}% LTV</span></div>
