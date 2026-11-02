@@ -91,13 +91,13 @@ def build_chart(hist, start=None):
     # percentile is a robust cap: it rides with the steady-state band
     # regardless of exactly how long the noisy stretch turns out to be, no
     # hardcoded day count. True values still render/label/tooltip correctly;
-    # see the clipped-point annotation below.
+    # see the cap note in the caption below.
     y_max_core = max(max(p["y"] for p in borrow), percentile([p["y"] for p in yieldp] + [p["y"] for p in rwap], 90))
     step = nice_step(y_max_core * 1.15)
     y_max = step * (int(y_max_core * 1.15 / step) + 1)
     y_min = 0
 
-    pad_l, pad_r, pad_t, pad_b = 44, 56, 28, 30
+    pad_l, pad_r, pad_t, pad_b = 44, 56, 12, 30
     W, H = 840, 300
     plot_w, plot_h = W - pad_l - pad_r, H - pad_t - pad_b
 
@@ -125,10 +125,9 @@ def build_chart(hist, start=None):
         x_ticks.append((sx(t), utc(t).strftime("%-d %b")))
 
     clipped = [p for p in yieldp + rwap if p["y"] > y_max]
-    annotation = ""
+    cap_note = ""
     if clipped:
         peak = max(clipped, key=lambda p: p["y"])
-        ax, ay = sx(peak["t"]), pad_t
         span_start = utc(min(p["t"] for p in clipped)).strftime("%-d %b")
         span_end = utc(max(p["t"] for p in clipped)).strftime("%-d %b")
         clipped_days = len({utc(p["t"]).strftime("%Y-%m-%d") for p in clipped})
@@ -137,62 +136,30 @@ def build_chart(hist, start=None):
         # first one, so they are NOT a seeding artefact, and no forceDeallocate
         # events exist on the vault. They are single-day jumps in a share-price-
         # derived APY, which a short lookback amplifies. State what is observed.
-        label = (
-            f"Capped at {y_max:g}%: {clipped_days} days above it "
-            f"({span_start} to {span_end}), peak {peak['y']:.0f}%"
-        )
-        annotation = (
-            f'<g class="chart-annot">'
-            f'<line x1="{ax:.1f}" y1="{ay:.1f}" x2="{ax:.1f}" y2="{ay + 10:.1f}" stroke="var(--kpk-ink-muted)" stroke-width="1"/>'
-            # The label is wider than half the plot, so it sits right-aligned above the
-            # plot wherever the peak falls; the short tick marks the peak itself.
-            f'<text x="{W - pad_r:.1f}" y="{ay - 10:.1f}" text-anchor="end">{label}</text>'
-            f"</g>"
+        cap_note = (
+            f"The axis is capped at {y_max:g}%; vault rates were above it on {clipped_days} days "
+            f"({span_start} to {span_end}), peak {peak['y']:.0f}%."
         )
 
-    # 30-day trend lines over the raw daily series. Deliberately an overlay, not a
-    # replacement: the daily variation is real and drives actual performance, so
-    # smoothing it away would hide the thing this chart exists to show. The trend
-    # just gives the eye a stable reference through the noise. Dashed and thinner
-    # so it reads as derived rather than as a second measurement.
-    # Only the yield leg gets a trend. The borrow rate is near-flat, so a trend
-    # line there is redundant; and Morpho returns nulls for `monthlyBorrowApy`
-    # until the market itself is 30 days old, so it would start a month late
-    # regardless. The vault's trend is derived from share price here, which is
-    # why it can cover the full window.
-    trend_paths = ""
-    yield_trend = since_open(hist.get("yield_apy_30d_pct") or [])
-    if yield_trend and len(yield_trend) > 1:
-        trend_paths = (
-            f'<path d="{path_for(yield_trend)}" fill="none" stroke="var(--c-yield)" '
-            f'stroke-width="1.25" stroke-dasharray="5 4" opacity="0.85" '
-            f'stroke-linejoin="round" stroke-linecap="round"/>'
-        )
-
+    # The blended rate is what the fund earns, so it is the headline line against
+    # the borrow rate; the two vaults are thin context lines without end labels.
+    # Before the fund moved into the RWA vault the blend equals KPK USDC Yield.
+    head = blendp or yieldp
     borrow_end = borrow[-1]
-    yield_end = yieldp[-1]
-    rwa_end = rwap[-1] if rwap else None
+    head_end = head[-1]
     # End labels sit in the right margin, beside their dots, spread at least 15px
     # apart in value order so near-equal rates never overprint each other.
-    ends = {"b": sy(borrow_end["y"]), "y": sy(yield_end["y"])}
-    if rwa_end:
-        ends["r"] = sy(rwa_end["y"])
-    order = sorted(ends, key=lambda k: ends[k])
-    for i in range(1, len(order)):
-        if ends[order[i]] - ends[order[i - 1]] < 15:
-            ends[order[i]] = ends[order[i - 1]] + 15
-    ey_b, ey_y = ends["b"], ends["y"]
-    ey_r = ends.get("r")
+    ends = {"b": sy(borrow_end["y"]), "h": sy(head_end["y"])}
+    if ends["h"] - ends["b"] < 15 and ends["b"] - ends["h"] < 15:
+        lo, hi = sorted(ends, key=lambda k: ends[k])
+        ends[hi] = ends[lo] + 15
+    ey_b, ey_h = ends["b"], ends["h"]
 
-    rwa_svg = ""
-    if rwa_end:
-        rwa_svg = (
-            f'<path d="{path_for(rwap)}" fill="none" stroke="var(--c-rwa)" '
-            f'stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>'
-            f'<circle cx="{sx(rwa_end["t"]):.1f}" cy="{ey_r:.1f}" r="4" fill="var(--c-rwa)" stroke="var(--kpk-surface-card)" stroke-width="2"/>'
-            f'<text x="{sx(rwa_end["t"]) + 9:.1f}" y="{ey_r:.1f}" text-anchor="start" dominant-baseline="middle" '
-            f'class="chart-endlabel" fill="var(--c-rwa)">{rwa_end["y"]:.2f}%</text>'
-        )
+    def context_line(series, color):
+        if not series:
+            return ""
+        return (f'<path d="{path_for(series)}" fill="none" stroke="{color}" stroke-width="1.5" opacity="0.6" '
+                f'stroke-linejoin="round" stroke-linecap="round"/>')
 
     grid_svg = "\n".join(
         f'<line x1="{pad_l}" y1="{y:.1f}" x2="{W - pad_r}" y2="{y:.1f}" class="chart-grid"/>'
@@ -205,18 +172,17 @@ def build_chart(hist, start=None):
     )
 
     svg = f"""
-    <svg viewBox="0 0 {W} {H}" id="rateChart" class="chart-svg" role="img" aria-label="Borrow APY and KPK USDC vault yield APYs, daily, since the position opened">
+    <svg viewBox="0 0 {W} {H}" id="rateChart" class="chart-svg" role="img" aria-label="Borrow APY and the fund's blended KPK USDC vault yield, daily, since the position opened">
       <g>{grid_svg}</g>
       <g>{xtick_svg}</g>
-      {annotation}
+      {context_line(yieldp, "var(--c-yield)")}
+      {context_line(rwap, "var(--c-rwa)")}
       <path d="{path_for(borrow)}" fill="none" stroke="var(--c-borrow)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
-      <path d="{path_for(yieldp)}" fill="none" stroke="var(--c-yield)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
-      {rwa_svg}
-      {trend_paths}
+      <path d="{path_for(head)}" fill="none" stroke="var(--kpk-ink)" stroke-width="2.75" stroke-linejoin="round" stroke-linecap="round"/>
       <circle cx="{sx(borrow_end['t']):.1f}" cy="{ey_b:.1f}" r="4" fill="var(--c-borrow)" stroke="var(--kpk-surface-card)" stroke-width="2"/>
-      <circle cx="{sx(yield_end['t']):.1f}" cy="{ey_y:.1f}" r="4" fill="var(--c-yield)" stroke="var(--kpk-surface-card)" stroke-width="2"/>
+      <circle cx="{sx(head_end['t']):.1f}" cy="{ey_h:.1f}" r="4" fill="var(--kpk-ink)" stroke="var(--kpk-surface-card)" stroke-width="2"/>
       <text x="{sx(borrow_end['t']) + 9:.1f}" y="{ey_b:.1f}" text-anchor="start" dominant-baseline="middle" class="chart-endlabel" fill="var(--c-borrow)">{borrow_end['y']:.2f}%</text>
-      <text x="{sx(yield_end['t']) + 9:.1f}" y="{ey_y:.1f}" text-anchor="start" dominant-baseline="middle" class="chart-endlabel" fill="var(--c-yield)">{yield_end['y']:.2f}%</text>
+      <text x="{sx(head_end['t']) + 9:.1f}" y="{ey_h:.1f}" text-anchor="start" dominant-baseline="middle" class="chart-endlabel" fill="var(--kpk-ink)">{head_end['y']:.2f}%</text>
       <rect id="hoverRect" x="{pad_l}" y="{pad_t}" width="{plot_w}" height="{plot_h}" fill="transparent"/>
       <line id="crosshair" x1="0" y1="{pad_t}" x2="0" y2="{pad_t + plot_h}" class="chart-crosshair" visibility="hidden"/>
     </svg>
@@ -271,6 +237,7 @@ def build_chart(hist, start=None):
         "yield_js": yield_js,
         "rwa_js": rwa_js,
         "blend_js": blend_js,
+        "cap_note": cap_note,
         "scale": {"x0": x0, "x1": x1, "y_min": y_min, "y_max": y_max,
                   "pad_l": pad_l, "plot_w": plot_w, "pad_t": pad_t, "plot_h": plot_h},
     }
@@ -1052,11 +1019,11 @@ vault_rows = "".join(
 
 legend = (
     '<div class="legend">'
+    '<span><i style="border-top:3px solid var(--kpk-ink)"></i><b>Blended vault yield</b></span>'
     '<span><i style="border-top-color:var(--c-borrow)"></i>Borrow APY · LsETH/USDC</span>'
-    '<span><i style="border-top-color:var(--c-yield)"></i>KPK USDC Yield</span>'
-    + ('<span><i style="border-top-color:var(--c-rwa)"></i>KPK USDC Yield RWA</span>' if hist.get("rwa_apy_pct") else "")
-    + '<span><i class="dash"></i>KPK USDC Yield · 30-day trend</span>'
-    '</div>')
+    '<span><i style="border-top:1.5px solid var(--c-yield);opacity:.6"></i>KPK USDC Yield</span>'
+    + ('<span><i style="border-top:1.5px solid var(--c-rwa);opacity:.6"></i>KPK USDC Yield RWA</span>' if hist.get("rwa_apy_pct") else "")
+    + '</div>')
 
 # Slider track: green up to the target LTV, orange by the repay trigger, red on to liquidation.
 _g_good = TARGET_LTV / lltv * 100
@@ -1319,14 +1286,12 @@ details.fold > summary { cursor: pointer; font-size: var(--kpk-text-body-small);
 details.fold[open] > summary { margin-bottom: 10px; }
 .legend { display: flex; gap: 18px; flex-wrap: wrap; font-size: var(--kpk-text-fs-meta); color: var(--kpk-ink-muted); align-items: center; margin-top: 10px; }
 .legend i { display: inline-block; width: 16px; height: 0; border-top: 2px solid var(--c-line); vertical-align: middle; margin-right: 6px; }
-.legend i.dash { border-top: 1.5px dashed var(--c-yield); }
 .chart { position: relative; margin-top: 10px; }
 .chart-svg { width: 100%; height: auto; display: block; overflow: visible; touch-action: pan-y; }
 .chart-svg text { font-family: var(--kpk-font-sans); fill: var(--kpk-ink-muted); font-size: 12px; }
 .chart-grid { stroke: var(--kpk-line); stroke-width: 1; }
 .chart-endlabel { font-size: 12px; font-weight: 500; }
 .chart-crosshair { stroke: var(--kpk-ink-muted); stroke-width: 1; }
-.chart-annot text { font-size: 11px; }
 .risk-list { display: flex; flex-direction: column; }
 .risk-row { display: grid; grid-template-columns: 160px 1fr 1.3fr; gap: 14px; padding: 10px 0; border-top: var(--kpk-rule-soft) solid var(--kpk-line); font-size: var(--kpk-text-body-small); }
 .risk-row:first-child { border-top: 0; padding-top: 0; }
@@ -1628,20 +1593,20 @@ page = f"""<!doctype html>
   {rebalance_card}
   {share_card}
   <div class="card">
-    <div class="stat-label">Borrow rate and vault yields since the position opened</div>
+    <div class="stat-label">Borrow rate and blended vault yield since the position opened</div>
     {legend}
     <div class="chart">
       {chart['svg']}
       <div id="chartTooltip" class="chart-tooltip" role="status">
         <div class="date" id="ttDate"></div>
+        <div class="row"><span class="key" style="background:var(--kpk-ink)"></span><b>Blended</b><span class="val" id="ttBlend"></span></div>
+        <div class="row"><span class="key" style="background:var(--c-borrow)"></span>Borrow<span class="val" id="ttBorrow"></span></div>
+        <div class="row"><span style="width:10px"></span>Spread<span class="val" id="ttDelta"></span></div>
         <div class="row"><span class="key" style="background:var(--c-yield)"></span>Yield<span class="val" id="ttYield"></span></div>
         <div class="row"><span class="key" style="background:var(--c-rwa)"></span>Yield RWA<span class="val" id="ttRwa"></span></div>
-        <div class="row"><span class="key" style="background:var(--c-borrow)"></span>Borrow<span class="val" id="ttBorrow"></span></div>
-        <div class="row"><span style="width:10px"></span>Blended<span class="val" id="ttBlend"></span></div>
-        <div class="row"><span style="width:10px"></span>Spread<span class="val" id="ttDelta"></span></div>
       </div>
     </div>
-    <div class="stat-sub">Daily borrow rate on the LsETH/USDC market against what both KPK USDC vaults paid: their realized rate as a 7-day average, net of fees and including Merkl rewards. The table's blended rate weights the two vaults by the fund's balance in each (KPK USDC Yield RWA since 27 Aug). The dashed line is KPK USDC Yield's 30-day trend.</div>
+    <div class="stat-sub">Daily borrow rate on the LsETH/USDC market against the fund's blended vault yield: both KPK USDC vaults' realized rates as a 7-day average, net of fees and including Merkl rewards, weighted by the fund's balance in each (KPK USDC Yield RWA since 27 Aug). The thin lines are the two vaults on their own. {chart['cap_note']}</div>
   </div>
   <div class="card">
     <details class="fold">
