@@ -56,10 +56,10 @@
   "risk": {
     "as_of": "2 Nov 2026",
     "title": "Automated in a band, alerted on carry, bounded onchain",
-    "lede": "KPK runs the position with deterministic agents. They act only through onchain permissions and within the settings KPK gives them: when a predefined condition is met, they execute a predefined action. The health factor manager keeps the loan in its band; the other agents move LsETH between the vault and the trading subaccount and propose the NAV. The fund's own position has no automated exit: a negative carry alerts KPK's risk team and triggers no automated action.",
+    "lede": "KPK runs the position with deterministic agents. They act only through onchain permissions and within the settings KPK gives them: when a predefined condition is met, they execute a predefined action. The health factor manager keeps the loan in its band; the other agents move LsETH between the vault and the trading subaccount and propose the NAV. A negative carry goes to KPK's risk team for review.",
     "steps": [
       ["Watch", "The agents read the position's health factor and the LsETH waiting in the vault. Hypernative watches the carry: the two vaults' yield against the LsETH/USDC borrow rate."],
-      ["Trigger", "Rules set in advance. Inside the health factor band, {repay_below} to {borrow_above}, nothing happens. Outside it, the health factor manager acts. A negative spread raises an alert, not a transaction."],
+      ["Trigger", "Rules set in advance. Inside the health factor band, {repay_below} to {borrow_above}, nothing happens. Outside it, the health factor manager acts. A negative spread raises an alert to KPK's risk team."],
       ["Act", "The agent sends the transaction itself: it repays to a health factor of {repay_to}, or borrows back to {borrow_to}, in steps of at least {min_change} USDC."],
       ["Bounded", "On the operator Safe, KPK's agents can call only the two LsETH transfer functions, through a Zodiac Roles module. NAV updates need KPK's and Upshift's signatures and stay within the vault owner's maximum change."]
     ],
@@ -99,7 +99,7 @@
         "sub": "Watched by Hypernative and by the vaults' own agents",
         "items": ["the two vaults' share-price yield", "the LsETH/USDC borrow rate", "the spread, as a 6-hour median"],
         "lists": [
-          {"title": "Alerts KPK's risk team, no automated action", "items": [
+          {"title": "Alerts KPK's risk team for review", "items": [
             "the spread turns negative"
           ]},
           {"title": "Automated on the KPK USDC vaults", "items": [
@@ -117,7 +117,7 @@
       "human": {
         "tag": "Layer 2 · human-reviewed",
         "title": "Negative carry goes to the risk team",
-        "body": "Hypernative watches the spread, the two vaults' share-price yield minus the LsETH/USDC borrow rate as a 6-hour median, and alerts KPK's risk team when it turns negative. The alert triggers no automated action. The fund's own position has no automated exit.",
+        "body": "Hypernative watches the spread, the two vaults' share-price yield minus the LsETH/USDC borrow rate as a 6-hour median, and alerts KPK's risk team when it turns negative. The team reviews each alert.",
         "chips": ["Hypernative"]
       }
     },
@@ -125,7 +125,7 @@
       {"name": "Health factor manager", "short": "keeps the health factor around 1.15", "body": "Keeps the position inside its band. Below a health factor of {repay_below} it repays to {repay_to}; above {borrow_above} it borrows back to {borrow_to}. Each change is at least {min_change} USDC, and new borrowing goes {split_yield}/{split_rwa} into KPK USDC Yield and KPK USDC Yield RWA."},
       {"name": "Deposit agents", "short": "put new LsETH to work", "body": "Move newly subscribed LsETH from the Upshift vault to the trading subaccount, and supply idle LsETH there as collateral on Morpho."},
       {"name": "Withdraw agent", "short": "funds redemptions", "body": "Moves LsETH back from the trading subaccount to the vault to pay redemptions."},
-      {"name": "NAV agent", "short": "proposes the NAV twice a week", "body": "Values the position with KPK's onchain NAV Calculator and checks it against an independent valuation, then proposes a NAV update on Mondays and Thursdays. Upshift co-signs each update, and each is bounded by a maximum change set by the vault owner.", "link": "nav_calculator"},
+      {"name": "NAV agent", "short": "proposes the NAV twice a week", "body": "KPK's NAV Calculator gives the fund's NAV at every block, and anyone can query it onchain. The Upshift vault records it twice a week: the NAV agent checks it against an independent valuation and proposes the update on Mondays and Thursdays. Upshift co-signs each update, bounded by a maximum change set by the vault owner.", "link": "nav_calculator"},
       {"name": "Agents on the KPK USDC vaults", "short": "rebalance, exit, monitoring", "body": "Both KPK USDC vaults run KPK's rebalance, exit and monitoring agents, which exit a market on a pause, exploit or oracle change. They act on the vaults, not on the fund's own loan."}
     ],
     "permissions": [
