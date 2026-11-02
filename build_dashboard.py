@@ -1139,6 +1139,38 @@ def risk_section():
 """
 
 
+SCALING = CONFIG["scaling"]
+SCALING_STATUS_CLASS = {"live": "positive", "under discussion": "info"}
+
+
+def scaling_rows():
+    """One table row per borrow venue; the status badge states the venue's real status."""
+    out = []
+    for s in SCALING["stages"]:
+        cls = SCALING_STATUS_CLASS.get(s["status"], "generic")
+        ics = "".join(icon(i, 20) for i in s.get("icons", []))
+        links = "".join(f'<div class="stat-sub">{ext(u, esc(t))}</div>' for t, u in s.get("links", []))
+        out.append(f'<tr><td class="nowrap"><b>{esc(s["stage"])}</b><div class="stage-icons">{ics}</div></td><td>{T(s["adds"])}</td>'
+                   f'<td>{T(s["needs"])}{links}</td><td class="nowrap"><span class="sc-badge {cls}">{esc(s["status"])}</span></td></tr>')
+    return "".join(out)
+
+
+def scaling_section():
+    """How the fund scales: the borrow venues beyond Morpho and where each stands."""
+    return f"""
+<section id="scaling">
+  <span class="label">How the fund scales</span>
+  <h2>{esc(SCALING['title'])}</h2>
+  <p class="lede">{esc(SCALING['intro'])}</p>
+  <div class="card"><div class="table-scroll"><table class="data">
+    <thead><tr><th>Stage</th><th>What the strategy adds</th><th>What it needs</th><th>Status</th></tr></thead>
+    <tbody>{scaling_rows()}</tbody></table></div>
+    <div class="stat-sub" style="margin-top:12px">{esc(SCALING['note'].format(as_of=SCALING['as_of']))}</div>
+  </div>
+</section>
+"""
+
+
 TERMS = CONFIG["terms"]
 terms_tiles = "".join(
     f'<div class="redeem-tile{" strong" if t.get("strong") else ""}"><div class="redeem-v">{esc(t["value"])}</div><div class="redeem-k">{esc(t["detail"])}</div></div>'
@@ -1258,6 +1290,10 @@ details.agent[open] > summary::after { content: "Show less"; }
 @media (max-width: 860px) { .riskflow { grid-template-columns: 1fr; } .rf-arrow { transform: rotate(90deg); justify-self: center; } }
 .perm-h { display: flex; gap: 10px; align-items: center; font-weight: 500; font-size: 16px; color: var(--kpk-ink); }
 .perm-h svg { color: var(--c-good); flex: none; }
+.stage-icons { display: flex; gap: 4px; margin-top: 6px; }
+.sc-badge { display: inline-block; font-size: var(--kpk-text-fs-tag); padding: 2px 8px; border-radius: var(--kpk-radius-tag); border: var(--kpk-rule-hard) solid var(--kpk-line); white-space: nowrap; }
+.sc-badge.positive { border-color: var(--c-good); color: var(--c-good); }
+.sc-badge.info { border-color: var(--c-info); color: var(--c-info); }
 .redeem { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 10px; }
 @media (max-width: 480px) { .redeem { grid-template-columns: 1fr; } }
 .redeem-tile { border: var(--kpk-rule-hard) solid var(--kpk-line); border-radius: var(--kpk-radius-label); padding: 12px 14px; }
@@ -1657,6 +1693,7 @@ page = f"""<!doctype html>
 </section>
 
 {risk_section()}
+{scaling_section()}
 <section id="terms">
   <span class="label">Risks and terms</span>
   <h2>{esc(MAIN_RISKS['title'])}</h2>

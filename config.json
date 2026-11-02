@@ -158,6 +158,40 @@
       {"icon": "sign", "title": "Both sides sign every NAV", "body": "Each NAV update needs both signatures and is bounded by a maximum change set by the vault owner.", "docs_link": true}
     ]
   },
+  "scaling": {
+    "_readme": "How the fund scales, after the risk section. The fund's size is capped by the USDC it can borrow against LsETH, so the rows are borrow venues, not fund sizes (no sourced size targets). status is one of: live, under discussion, candidate (anything else renders neutral). Aave rows state the real forum status: V3 has a temp check (passed on Snapshot) and an ARFC thread, no ARFC Snapshot vote and no AIP; V4 has no thread, so it is a candidate, not planned. as_of is the date the Aave status was last checked against the Aave governance forum and Snapshot; update it with the copy. Placeholders as above.",
+    "title": "Sized by borrowing capacity, not by date",
+    "intro": "The fund can grow only as far as the USDC it can borrow against LsETH, today one Morpho market. Aave listings would add venues; they are the Aave DAO's decision.",
+    "stages": [
+      {
+        "stage": "Today",
+        "adds": "USDC borrowed on the Morpho LsETH/USDC market at an {lltv} LLTV, where KPK curates both sides",
+        "needs": "In place",
+        "status": "live",
+        "icons": ["morpho"]
+      },
+      {
+        "stage": "Aave V3",
+        "adds": "LsETH as collateral on Aave V3 Core on Ethereum",
+        "needs": "A DAO vote on terms that allow USDC borrowing; the draft is collateral-only, in the ETH correlated eMode. Then agent, NAV and permission work.",
+        "links": [
+          ["ARFC thread ↗", "https://governance.aave.com/t/arfc-onboard-lseth-to-aave-v3-core-instance/22957"],
+          ["Temp check ↗", "https://governance.aave.com/t/temp-check-onboard-lseth-to-aave-v3-core-instance/22832"]
+        ],
+        "status": "under discussion",
+        "icons": ["aave"]
+      },
+      {
+        "stage": "Aave V4",
+        "adds": "LsETH as collateral on Aave V4 on Ethereum",
+        "needs": "A listing proposal; none exists on the forum yet. Then the same agent, NAV and permission work.",
+        "status": "candidate",
+        "icons": ["aave"]
+      }
+    ],
+    "as_of": "2 Nov 2026",
+    "note": "Checked {as_of} on the Aave forum and Snapshot: the V3 temp check passed, its ARFC is open, and LsETH is not listed on V3 or V4."
+  },
   "main_risks": {
     "_readme": "One row per key risk in the fund docs: the risk, then how it is handled. Facts only from this page or the docs. Placeholders as above.",
     "title": "Main risks, and how they are handled",
