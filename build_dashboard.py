@@ -563,6 +563,10 @@ else:
 
 DOCS = CONFIG["docs"]
 CONTRACTS = CONFIG["contracts"]
+MAIN_RISKS = CONFIG["main_risks"]
+risk_rows = "".join(
+    f'<div class="risk-row"><div class="risk-n">{esc(n)}</div><div class="risk-d">{T(d)}</div><div class="risk-h">{T(h)}</div></div>'
+    for n, d, h in MAIN_RISKS["rows"])
 
 share_card = ""
 if share_chart:
@@ -960,6 +964,12 @@ details.fold[open] > summary { margin-bottom: 10px; }
 .chart-endlabel { font-size: 12px; font-weight: 500; }
 .chart-crosshair { stroke: var(--kpk-ink-muted); stroke-width: 1; }
 .chart-annot text { font-size: 11px; }
+.risk-list { display: flex; flex-direction: column; }
+.risk-row { display: grid; grid-template-columns: 160px 1fr 1.3fr; gap: 14px; padding: 10px 0; border-top: var(--kpk-rule-soft) solid var(--kpk-line); font-size: var(--kpk-text-body-small); }
+.risk-row:first-child { border-top: 0; padding-top: 0; }
+.risk-n { font-weight: 500; }
+.risk-h { color: var(--kpk-ink-muted); padding-left: 10px; border-left: 2px solid var(--c-band); }
+@media (max-width: 760px) { .risk-row { grid-template-columns: 1fr; gap: 4px; } }
 .chart-mark { stroke: var(--kpk-ink-faint); stroke-width: 1.2; stroke-dasharray: 5 3; }
 .chart-svg text.chart-marklabel { font-size: 11px; }
 @media (max-width: 640px) {
@@ -1302,8 +1312,12 @@ page = f"""<!doctype html>
 
 {risk_section()}
 <section id="terms">
-  <span class="label">Terms</span>
-  <h2>Subscriptions, redemptions and fees</h2>
+  <span class="label">Risks and terms</span>
+  <h2>{esc(MAIN_RISKS['title'])}</h2>
+  <div class="card">
+    <div class="risk-list">{risk_rows}</div>
+  </div>
+  <div class="sub-h">Subscriptions, redemptions and fees</div>
   <div class="grid g2">
     <div class="card">
       <div class="stat-label">Subscriptions and redemptions</div>

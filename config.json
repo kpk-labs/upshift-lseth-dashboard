@@ -147,6 +147,20 @@
       {"icon": "sign", "title": "Both sides sign every NAV", "body": "Each NAV update needs both signatures and is bounded by a maximum change set by the vault owner.", "docs_link": true}
     ]
   },
+  "main_risks": {
+    "_readme": "One row per key risk in the fund docs: the risk, then how it is handled. Facts only from this page or the docs. Placeholders as above.",
+    "title": "Main risks, and how they are handled",
+    "rows": [
+      ["ETH price", "Holders keep full exposure to the ETH price.", "ETH exposure is the product itself: the fund earns its carry on top of LsETH and its staking yield. The loan runs at a {target_ltv} LTV target against an {lltv} LLTV."],
+      ["Liquidation", "ETH falls faster than the position can be deleveraged.", "Below a health factor of {repay_below} ({repay_below_ltv} LTV), the health factor manager repays USDC until it is back at {repay_to} ({repay_to_ltv}), with no human approval needed. The market liquidates at its {lltv} LLTV."],
+      ["Negative carry", "The USDC borrow rate rises above what the two KPK USDC vaults earn.", "Hypernative watches the spread as a 6-hour median and alerts KPK's risk team when it turns negative. The team reviews each alert."],
+      ["LsETH", "Validator slashing and redemption delays at Liquid Collective.", "LsETH is the market's collateral, reviewed under KPK's Risk Framework, and it can be redeemed through approved platforms such as Figment and Kraken or sold on DEXes. A fall in its price lowers the health factor, which the health factor manager acts on."],
+      ["RWA credit", "KPK USDC Yield RWA lends against tokenised real-world assets, mainly private credit and tokenised funds.", "It lends only in markets other curators also supply, with a cap on each market, against collateral that has passed KPK's Risk Framework. Its exit agent withdraws the fund's USDC on an exploit-class, pause or oracle alert on one of those markets, or on a vault-level alert."],
+      ["Vault liquidity", "Thin liquidity in the two KPK USDC vaults can delay deleveraging and redemptions.", "KPK curates both vaults and runs rebalance, exit and monitoring agents on them around the clock, which keep allocations within their caps and liquidity buffers. On an alert, the exit agents bring the fund's USDC back to the trading subaccount."],
+      ["Oracles", "Manipulation, staleness or failure of a price feed, which would affect collateral valuation and liquidations.", "The LsETH/USDC market prices LsETH with a Chainlink oracle, and the NAV agent checks the NAV against an independent valuation. An oracle alert on a market a KPK USDC vault lends into sends that vault's exit agent to withdraw the fund's USDC."],
+      ["Smart contracts and dependencies", "Upshift's vault contracts, Morpho, Liquid Collective and the KPK-curated vaults.", "Collateral and venues are reviewed under KPK's Risk Framework, more than 150 checks across 12 risk dimensions. A 3-of-4 Safe with two KPK and two Upshift seats owns the vault, and KPK's agents can call only the two LsETH transfer functions on the operator Safe, through a Zodiac Roles module."]
+    ]
+  },
   "terms": {
     "tiles": [
       {"value": "Instant", "detail": "subscriptions, up to the vault's 10,000 LsETH cap"},
