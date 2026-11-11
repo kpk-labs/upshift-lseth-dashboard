@@ -6,7 +6,7 @@ into the KPK USDC Morpho vaults. Shows the carry and its formula, the position,
 the full rate history, a carry simulator, how KPK manages risk, and the terms.
 Layout and design system follow KPK's BTC Carry Fund board.
 
-**Live page:** https://external.kpk.io/upshift-lseth-dashboard/ (copied from this repo every 4 hours by kpk-labs/external-resources)
+**Live page:** https://external.kpk.io/staking-carry-fund/lsETH/ (copied from this repo every 4 hours by kpk-labs/external-resources)
 
 ## How it updates
 
