@@ -1511,8 +1511,8 @@ page = f"""<!doctype html>
 <meta property="og:title" content="LsETH Carry Fund | KPK">
 <meta property="og:type" content="website">
 <meta property="og:site_name" content="KPK">
-<meta property="og:url" content="https://external.kpk.io/upshift-lseth-dashboard/">
-<meta property="og:image" content="https://external.kpk.io/upshift-lseth-dashboard/og.png">
+<meta property="og:url" content="https://external.kpk.io/staking-carry-fund/lseth/">
+<meta property="og:image" content="https://external.kpk.io/staking-carry-fund/lseth/og.png">
 <meta property="og:image:type" content="image/png">
 <meta property="og:image:width" content="1200">
 <meta property="og:image:height" content="630">
